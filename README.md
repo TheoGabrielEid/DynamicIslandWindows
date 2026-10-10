@@ -22,7 +22,7 @@ A sleek, fluid **Material Capsule / Material 3 Expressive** desktop overlay for 
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/<your-username>/DynamicIslandWindows.git
+   git clone https://github.com/TheoGabrielEid/DynamicIslandWindows.git
    cd DynamicIslandWindows
    ```
 
