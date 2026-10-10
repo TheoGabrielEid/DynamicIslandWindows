@@ -18,6 +18,14 @@ import subprocess
 import warnings
 import json
 import ctypes
+from ctypes import wintypes
+import gc
+import glob
+import fnmatch
+import socket
+from collections import deque
+import shutil
+import faulthandler
 import queue
 import threading
 import urllib.request
@@ -33,12 +41,12 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Pre-flight check for PyQt6
 try:
-    from PyQt6.QtCore import Qt, QTimer, QTime, QRectF, QPointF, QRect, pyqtSignal, QThread
+    from PyQt6.QtCore import Qt, QTimer, QTime, QRectF, QPointF, QRect, pyqtSignal, QThread, QFileSystemWatcher
     from PyQt6.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
         QAbstractButton, QSlider, QStackedWidget, QSystemTrayIcon, QMenu,
-        QGraphicsOpacityEffect, QPushButton, QFrame, QCheckBox, QScrollArea,
-        QInputDialog, QLineEdit, QTextEdit
+        QGraphicsOpacityEffect, QPushButton, QFrame, QCheckBox, QScrollArea, QSizePolicy,
+        QInputDialog
     )
     from PyQt6.QtGui import (
         QPainter, QColor, QBrush, QPen, QFont, QPainterPath, QLinearGradient,
@@ -71,6 +79,12 @@ try:
     PYCAW = True
 except Exception:
     PYCAW = False
+
+# Only needed to name the app that is playing; optional
+try:
+    from pycaw.pycaw import IAudioSessionManager2, IAudioSessionControl2
+except Exception:
+    IAudioSessionManager2 = IAudioSessionControl2 = None
 
 try:
     import pynvml
@@ -112,7 +126,6 @@ def font(size, weight=QFont.Weight.Normal):
 
 
 DEFAULT_BUTTONS = [
-    {"id": "ai", "label": "AI Assistant", "icon": "spark", "action": "ai"},
     {"id": "snip", "label": "Screenshot", "icon": "snip", "action": "snip"},
     {"id": "mute", "label": "Mute", "icon": "mute", "action": "mute"},
     {"id": "lock", "label": "Lock", "icon": "lock", "action": "lock"},
@@ -121,7 +134,6 @@ DEFAULT_BUTTONS = [
 ]
 
 AVAILABLE_BUTTON_PRESETS = [
-    {"id": "ai", "label": "AI Assistant", "icon": "spark", "action": "ai"},
     {"id": "calc", "label": "Calculator", "icon": "calc", "action": "calc"},
     {"id": "notepad", "label": "Notepad", "icon": "note", "action": "notepad"},
     {"id": "term", "label": "Terminal", "icon": "term", "action": "term"},
@@ -134,22 +146,71 @@ AVAILABLE_BUTTON_PRESETS = [
     {"id": "settings", "label": "Settings", "icon": "settings", "action": "settings"},
 ]
 
+def mono(size, weight=QFont.Weight.Normal):
+    """Fixed-pitch digits, so numbers and addresses do not shimmy as they change."""
+    f = QFont("Cascadia Mono")
+    f.setFamilies(["Cascadia Mono", "Consolas", "Courier New"])
+    f.setPixelSize(size)
+    f.setWeight(weight)
+    return f
+
+
+class WINDOWPOS(ctypes.Structure):
+    _fields_ = [("hwnd", wintypes.HWND), ("hwndInsertAfter", wintypes.HWND),
+                ("x", ctypes.c_int), ("y", ctypes.c_int), ("cx", ctypes.c_int), ("cy", ctypes.c_int),
+                ("flags", ctypes.c_uint)]
+
+
+# System-page monitors: id -> (label, icon, ring color; None = follow the accent color)
+# Entries without an icon are not gauges: they switch parts of the network strip on.
+MONITORS = {
+    "cpu": ("CPU", "cpu", None),
+    "ram": ("Memory", "ram", M3.GREEN),
+    "gpu": ("GPU", "gpu", M3.NVIDIA),
+    "disk": ("Disk", "disk", QColor(0xE8, 0x9A, 0xB5)),
+    "net_down": ("Download", "arrow_down", QColor(0xF5, 0xC0, 0x4A)),
+    "net_up": ("Upload", "arrow_up", QColor(0x6F, 0xD8, 0xF5)),
+    "battery": ("Battery", "battery", M3.ORANGE),
+    "net_graph": ("Traffic graph", None, None),
+    "ips": ("LAN / WAN IP", None, None),
+}
+MONITOR_ORDER = list(MONITORS)
+
+
+def monitor_available(mid):
+    """Whether this PC can actually feed the given monitor."""
+    if not HAS_PSUTIL:
+        return False
+    if mid == "gpu":
+        return gpu_stats() is not None
+    if mid == "battery":
+        try:
+            return psutil.sensors_battery() is not None
+        except Exception:
+            return False
+    return mid in MONITORS
+
+
+def default_monitors():
+    """Everything this PC has, minus the opt-in ones: the disk gauge, and the IP
+    readout (showing the WAN address means asking an outside service for it)."""
+    return [m for m in MONITOR_ORDER if m not in ("disk", "ips") and monitor_available(m)]
+
+
 # ───────────────────────── Settings & Persistence ─────────────────────────
 class SettingsManager:
     DEFAULTS = {
         "idle_width": 196,
         "exp_height": 268,
         "top_offset": 8,
-        "collapse_delay": 180,
-        "always_on_top": True,
+        "collapse_delay": 1000,  # ms the capsule stays open after the mouse leaves
+        "always_on_top": False,  # False = desktop level: other windows cover the capsule
         "start_on_boot": False,
         "accent_color": "#A8C7FA",
         "clipboard_toast": True,
+        "wan_vpn_color": True,  # WAN address green while a VPN carries the traffic, red otherwise
+        "monitors": None,  # None = auto-detect (see default_monitors)
         "tools_buttons": DEFAULT_BUTTONS,
-        "ai_endpoint": "https://api.openai.com/v1/chat/completions",
-        "ai_model": "gpt-4o-mini",
-        "ai_api_key": "",
-        "ai_temperature": 0.7,
     }
 
     def __init__(self):
@@ -234,17 +295,10 @@ def set_windows_autostart(enable: bool):
 
 # ───────────────────────── System services ─────────────────────────
 class Volume:
+    """Cached master volume. Every COM call happens on the AudioWorker thread."""
     _cached_vol = 50
     _cached_mute = False
-
-    @staticmethod
-    def _dev():
-        if not PYCAW:
-            return None
-        try:
-            return AudioUtilities.GetSpeakers()
-        except Exception:
-            return None
+    worker = None
 
     @classmethod
     def get(cls):
@@ -257,127 +311,134 @@ class Volume:
     @classmethod
     def set(cls, pct):
         cls._cached_vol = int(max(0, min(100, pct)))
-        if not PYCAW:
-            return
-        try:
-            dev = cls._dev()
-            if dev and hasattr(dev, "EndpointVolume") and dev.EndpointVolume:
-                dev.EndpointVolume.SetMasterVolumeLevelScalar(cls._cached_vol / 100.0, None)
-        except Exception:
-            pass
+        if cls.worker:
+            cls.worker.request_volume(cls._cached_vol)
 
     @classmethod
     def toggle_mute(cls):
-        if not PYCAW:
-            cls._cached_mute = not cls._cached_mute
-            return cls._cached_mute
-        try:
-            dev = cls._dev()
-            if dev and hasattr(dev, "EndpointVolume") and dev.EndpointVolume:
-                ev = dev.EndpointVolume
-                m = not ev.GetMute()
-                ev.SetMute(m, None)
-                cls._cached_mute = m
-                return m
-        except Exception:
-            pass
         cls._cached_mute = not cls._cached_mute
+        if cls.worker:
+            cls.worker.request_mute(cls._cached_mute)
         return cls._cached_mute
 
 
 class AudioWorker(QThread):
-    """Background worker that queries Windows COM audio without blocking the UI loop."""
+    """Background worker that owns all Windows COM audio objects.
+
+    The endpoint is opened once and reused (re-resolved every few seconds so a
+    newly plugged headset is picked up). Volume / mute changes from the UI are
+    queued here, so the UI thread never touches COM and never blocks on it.
+    """
     audio_updated = pyqtSignal(bool, float, str, int, bool)
+    REOPEN_SECS = 4.0
+    APP_SCAN_SECS = 1.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._running = True
+        self._stop_evt = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._want_vol = None
+        self._want_mute = None
+
+    def request_volume(self, pct):
+        with self._lock:
+            self._want_vol = pct
+        self._wake.set()
+
+    def request_mute(self, mute):
+        with self._lock:
+            self._want_mute = bool(mute)
+        self._wake.set()
 
     def stop(self):
-        self._running = False
-        self.wait(400)
+        self._stop_evt.set()
+        self._wake.set()
+        self.wait(1500)
 
-    def run(self):
-        try:
-            import pythoncom
-            pythoncom.CoInitialize()
-        except Exception:
-            pythoncom = None
+    @staticmethod
+    def _open():
+        dev = AudioUtilities.GetSpeakers()
+        raw = getattr(dev, "_dev", dev)  # newer pycaw wraps the IMMDevice
+        vol = raw.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None).QueryInterface(IAudioEndpointVolume)
+        meter = raw.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None).QueryInterface(IAudioMeterInformation)
+        mgr = None
+        if IAudioSessionManager2 is not None:
             try:
-                ctypes.windll.ole32.CoInitialize(None)
+                mgr = raw.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None).QueryInterface(IAudioSessionManager2)
+            except Exception:
+                mgr = None
+        return vol, meter, mgr
+
+    @staticmethod
+    def _loudest_app(mgr):
+        """Name of the process currently making the most noise ('' if unknown)."""
+        best, name = 0.01, ""
+        sessions = mgr.GetSessionEnumerator()
+        for i in range(sessions.GetCount()):
+            try:
+                s = sessions.GetSession(i)
+                sp = float(s.QueryInterface(IAudioMeterInformation).GetPeakValue())
+                if sp > best:
+                    pid = s.QueryInterface(IAudioSessionControl2).GetProcessId()
+                    if pid:
+                        best, name = sp, pretty_app(psutil.Process(pid).name())
             except Exception:
                 pass
+        return name
 
+    def run(self):
+        if not PYCAW:
+            return
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 0)  # 0 = COINIT_MULTITHREADED
+        except Exception:
+            pass
+
+        vol = meter = mgr = None
+        opened_at = app_scan_at = 0.0
         hits = 0
         last_sound = 0.0
         playing = False
-        app_name = ""
+        app_name = cur_app = ""
+        last_emit = None
 
-        while self._running:
-            peak = 0.0
-            cur_app = ""
-            vol_val = Volume._cached_vol
-            is_muted = Volume._cached_mute
-
-            if PYCAW:
+        while not self._stop_evt.is_set():
+            now = time.monotonic()
+            if vol is None or now - opened_at > self.REOPEN_SECS:
+                vol = meter = mgr = None
+                opened_at = now
                 try:
-                    dev = None
-                    try:
-                        dev = AudioUtilities.GetSpeakers()
-                    except Exception:
-                        dev = None
+                    vol, meter, mgr = self._open()
+                except Exception:
+                    vol = meter = mgr = None
 
-                    if dev:
-                        if hasattr(dev, "EndpointVolume") and dev.EndpointVolume:
-                            try:
-                                ev = dev.EndpointVolume
-                                vol_val = int(round(ev.GetMasterVolumeLevelScalar() * 100))
-                                is_muted = bool(ev.GetMute())
-                                Volume._cached_vol = vol_val
-                                Volume._cached_mute = is_muted
-                            except Exception:
-                                pass
+            with self._lock:
+                want_vol, self._want_vol = self._want_vol, None
+                want_mute, self._want_mute = self._want_mute, None
 
-                        # Check master endpoint meter first
-                        if hasattr(dev, "_dev") and dev._dev:
-                            try:
-                                meter_itf = dev._dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
-                                meter = cast(meter_itf, POINTER(IAudioMeterInformation))
-                                peak = float(meter.GetPeakValue())
-                            except Exception:
-                                pass
+            peak = 0.0
+            vol_val, is_muted = Volume._cached_vol, Volume._cached_mute
+            if vol is not None:
+                try:
+                    if want_vol is not None:
+                        vol.SetMasterVolumeLevelScalar(want_vol / 100.0, None)
+                    if want_mute is not None:
+                        vol.SetMute(int(want_mute), None)
+                    vol_val = int(round(vol.GetMasterVolumeLevelScalar() * 100))
+                    is_muted = bool(vol.GetMute())
+                    peak = float(meter.GetPeakValue())
+                except Exception:
+                    vol = meter = mgr = None  # device went away; reopen on the next pass
 
-                        # If audio is playing or to identify active session
-                        if hasattr(dev, "AudioSessionManager") and dev.AudioSessionManager:
-                            try:
-                                mgr = dev.AudioSessionManager
-                                sessions = mgr.GetSessionEnumerator()
-                                count = sessions.GetCount() if hasattr(sessions, "GetCount") else 0
-                                for i in range(count):
-                                    try:
-                                        s = sessions.GetSession(i)
-                                        s_meter = s.QueryInterface(IAudioMeterInformation)
-                                        sp = float(s_meter.GetPeakValue())
-                                        if sp > 0.01:
-                                            if sp > peak:
-                                                peak = sp
-                                            if HAS_PSUTIL and psutil:
-                                                try:
-                                                    from pycaw.pycaw import IAudioSessionControl2
-                                                    ctl2 = s.QueryInterface(IAudioSessionControl2)
-                                                    pid = ctl2.GetProcessId()
-                                                    if pid:
-                                                        cur_app = psutil.Process(pid).name().replace(".exe", "").capitalize()
-                                                except Exception:
-                                                    pass
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
+            if (mgr is not None and peak > 0.005 and HAS_PSUTIL
+                    and IAudioSessionControl2 is not None and now - app_scan_at > self.APP_SCAN_SECS):
+                app_scan_at = now
+                try:
+                    cur_app = self._loudest_app(mgr) or cur_app
                 except Exception:
                     pass
 
-            now = time.monotonic()
             if peak > 0.005:
                 hits += 1
                 last_sound = now
@@ -389,164 +450,430 @@ class AudioWorker(QThread):
                 hits = 0
                 if playing and now - last_sound > 1.2:
                     playing = False
-                    app_name = ""
+                    app_name = cur_app = ""
 
-            try:
-                self.audio_updated.emit(playing, peak, app_name, vol_val, is_muted)
-            except Exception:
-                pass
-            time.sleep(0.08)
-
-        if pythoncom:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-        else:
-            try:
-                ctypes.windll.ole32.CoUninitialize()
-            except Exception:
-                pass
-
-
-# ───────────────────────── AI Streaming Service & Cache ─────────────────────────
-class AICache:
-    """Lightweight in-memory LRU-like cache for deterministic prompts/actions."""
-    _cache = {}
-    _MAX = 50
-
-    @classmethod
-    def get(cls, key: str):
-        return cls._cache.get(key)
-
-    @classmethod
-    def put(cls, key: str, val: str):
-        if len(cls._cache) >= cls._MAX:
-            try:
-                oldest = next(iter(cls._cache))
-                del cls._cache[oldest]
-            except Exception:
-                cls._cache.clear()
-        cls._cache[key] = val
-
-
-class AIServiceWorker(QThread):
-    """
-    Decoupled Background AI Thread.
-    Uses SSE/chunked streaming over standard HTTP (or Ollama/local OpenAI-compatible endpoints)
-    without blocking the PyQt GUI thread. Supports atomic cancellation and thread-safe signals.
-    """
-    chunk_received = pyqtSignal(str)    # partial token/chunk
-    response_finished = pyqtSignal(str) # full concatenated text
-    error_occurred = pyqtSignal(str)    # error message
-    started_streaming = pyqtSignal()    # time-to-first-token trigger
-
-    def __init__(self, endpoint: str, api_key: str, model: str, prompt: str,
-                 system_prompt: str = "You are a concise, helpful desktop assistant.",
-                 temperature: float = 0.7, parent=None):
-        super().__init__(parent)
-        self.endpoint = endpoint.strip() or "https://api.openai.com/v1/chat/completions"
-        self.api_key = api_key.strip()
-        self.model = model.strip() or "gpt-4o-mini"
-        self.prompt = prompt.strip()
-        self.system_prompt = system_prompt
-        self.temperature = float(temperature)
-        self._is_cancelled = threading.Event()
-        self._accumulated = []
-
-    def cancel(self):
-        """Immediately marks request as cancelled; terminates stream processing."""
-        self._is_cancelled.set()
-
-    def run(self):
-        if not self.prompt:
-            self.error_occurred.emit("Empty prompt")
-            return
-
-        cache_key = f"{self.model}:{self.prompt}"
-        cached = AICache.get(cache_key)
-        if cached:
-            if not self._is_cancelled.is_set():
-                self.started_streaming.emit()
-                for word in cached.split(" "):
-                    if self._is_cancelled.is_set():
-                        return
-                    self.chunk_received.emit(word + " ")
-                    time.sleep(0.015)
-                self.response_finished.emit(cached)
-            return
-
-        # Prepare request payload
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": self.prompt}
-            ],
-            "temperature": self.temperature,
-            "stream": True
-        }
-        body_bytes = json.dumps(payload).encode("utf-8")
-
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "DynamicIslandWindows/1.0"
-        }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        req = urllib.request.Request(self.endpoint, data=body_bytes, headers=headers, method="POST")
-
-        first_token = True
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                for raw_line in resp:
-                    if self._is_cancelled.is_set():
-                        return
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line or line.startswith(":"):
-                        continue
-                    if line == "data: [DONE]":
-                        break
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        try:
-                            chunk_obj = json.loads(data_str)
-                            choices = chunk_obj.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    if first_token:
-                                        first_token = False
-                                        self.started_streaming.emit()
-                                    self._accumulated.append(content)
-                                    self.chunk_received.emit(content)
-                        except Exception:
-                            pass
-
-            full_text = "".join(self._accumulated).strip()
-            if not self._is_cancelled.is_set():
-                if full_text:
-                    AICache.put(cache_key, full_text)
-                    self.response_finished.emit(full_text)
-                else:
-                    self.error_occurred.emit("Empty response from model")
-        except urllib.error.HTTPError as e:
-            if not self._is_cancelled.is_set():
-                err_body = ""
+            state = (playing, round(peak, 2), app_name, vol_val, is_muted)
+            if state != last_emit:
+                last_emit = state
                 try:
-                    err_body = e.read().decode("utf-8", errors="replace")[:140]
+                    self.audio_updated.emit(playing, peak, app_name, vol_val, is_muted)
                 except Exception:
                     pass
-                msg = f"HTTP {e.code}: {e.reason}" + (f" ({err_body})" if err_body else "")
-                self.error_occurred.emit(msg)
-        except urllib.error.URLError as e:
-            if not self._is_cancelled.is_set():
-                self.error_occurred.emit(f"Network error: {e.reason}")
-        except Exception as e:
-            if not self._is_cancelled.is_set():
-                self.error_occurred.emit(f"Error: {e}")
+
+            self._wake.wait(0.08)
+            self._wake.clear()
+
+        # Release every COM pointer on this thread before leaving the apartment
+        vol = meter = mgr = None
+        gc.collect()
+        try:
+            ctypes.windll.ole32.CoUninitialize()
+        except Exception:
+            pass
+
+
+class NetMeter:
+    """Traffic, LAN address and VPN state, all derived locally from psutil + the routing table."""
+    # VPN / virtual adapters carry the same bytes a second time, so they are not metered
+    SKIP = ("loopback", "tailscale", "nordlynx", "nordvpn", "wireguard", "openvpn", "vpn", "tap-",
+            "teredo", "isatap", "vethernet", "bluetooth")
+    VPN = ("nordlynx", "nordvpn", "wireguard", "openvpn", "tailscale", "vpn", "tap-")
+    MIN_SCALE = 125_000.0   # 1 Mbps in bytes/s: floor for autoscaling, so idle noise stays small
+    HISTORY = 60            # one bar per second
+
+    def __init__(self):
+        self.prev = None
+        self.prev_t = 0.0
+        self.down = self.up = 0.0
+        self.scale = self.MIN_SCALE
+        self.hist_down = deque([0.0] * self.HISTORY, maxlen=self.HISTORY)
+        self.hist_up = deque([0.0] * self.HISTORY, maxlen=self.HISTORY)
+        self.totals = {}        # adapter -> bytes so far (picks the busiest physical adapter)
+        self.lan_ip = ""
+        self.vpn = False
+        self.route_key = None   # changes whenever the route to the internet changes
+
+    @classmethod
+    def _skipped(cls, name):
+        low = name.lower()
+        return any(s in low for s in cls.SKIP)
+
+    def sample(self):
+        rx = tx = 0
+        for name, c in psutil.net_io_counters(pernic=True).items():
+            if self._skipped(name):
+                continue
+            rx += c.bytes_recv
+            tx += c.bytes_sent
+            self.totals[name] = c.bytes_recv + c.bytes_sent
+        now = time.monotonic()
+        if self.prev is not None:
+            dt = now - self.prev_t
+            if dt < 0.2:
+                return
+            d_rx, d_tx = rx - self.prev[0], tx - self.prev[1]
+            if d_rx >= 0 and d_tx >= 0:  # negative = an adapter vanished and its counters with it
+                self.down, self.up = d_rx / dt, d_tx / dt
+            self.scale = max(self.MIN_SCALE, self.scale * 0.97, self.down, self.up)
+            self.hist_down.append(self.down)
+            self.hist_up.append(self.up)
+        self.prev, self.prev_t = (rx, tx), now
+
+    def probe(self):
+        """Refresh lan_ip / vpn. Returns True when the route to the internet changed.
+
+        "Is the VPN on" is answered by the routing table, not by the adapter existing:
+        NordLynx stays up with an address even while disconnected. A UDP connect()
+        sends nothing; it only asks Windows which local address it would route from.
+        """
+        src = ""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 53))
+            src = s.getsockname()[0]
+        except OSError:
+            pass
+        finally:
+            s.close()
+
+        route_nic, physical = "", []
+        try:
+            up = {n for n, st in psutil.net_if_stats().items() if st.isup}
+            for name, addrs in psutil.net_if_addrs().items():
+                for a in addrs:
+                    if a.family != socket.AF_INET or a.address.startswith(("127.", "169.254.")):
+                        continue
+                    if a.address == src:
+                        route_nic = name
+                    if name in up and not self._skipped(name):
+                        physical.append((self.totals.get(name, 0), a.address))
+        except Exception:
+            pass
+
+        low = route_nic.lower()
+        self.vpn = bool(route_nic) and any(v in low for v in self.VPN)
+        # Under a VPN the LAN address is still the physical adapter's, not the tunnel's
+        self.lan_ip = max(physical)[1] if physical and (self.vpn or not src) else src
+        key = (src, self.vpn)
+        changed = key != self.route_key
+        self.route_key = key
+        return changed
+
+
+def fmt_rate(bps):
+    """Bytes/second -> ('1.2', 'Mbps'), in the units internet speeds are quoted in."""
+    bits = bps * 8
+    if bits < 999_500:
+        return f"{bits / 1e3:.0f}", "Kbps"
+    if bits < 99.95e6:
+        return f"{bits / 1e6:.1f}", "Mbps"
+    if bits < 999.5e6:
+        return f"{bits / 1e6:.0f}", "Mbps"
+    return f"{bits / 1e9:.2f}", "Gbps"
+
+
+def fetch_wan_ip(timeout=6):
+    """Public IPv4 address, or '' on failure. The one outbound request this app makes on
+    its own, and only while the LAN / WAN readout is switched on."""
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=timeout) as resp:
+            text = resp.read(64).decode("ascii", "ignore").strip()
+        socket.inet_aton(text)
+        return text if text.count(".") == 3 else ""
+    except Exception:
+        return ""
+
+
+# ───────────────────────── App launcher (menu.json) ─────────────────────────
+MENU_FILE = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DynamicIsland", "menu.json")
+
+# Written the first time the app runs; edit it from right-click → Apps → Edit menu file
+DEFAULT_MENU = {
+    "groups": [
+        {"name": "Apps", "items": [
+            {"name": "Notepad", "path": "notepad.exe"},
+            {"name": "Calculator", "path": "calc.exe"},
+            {"name": "File Explorer", "path": "explorer.exe"},
+        ]},
+        {"name": "System", "items": [
+            {"name": "Settings", "path": "ms-settings:"},
+            {"name": "Task Manager", "path": "taskmgr.exe"},
+            {"name": "Terminal (Admin)", "path": "cmd.exe", "runAsAdmin": True},
+        ]},
+        {"name": "Web", "items": [
+            {"name": "Google", "path": "https://www.google.com"},
+        ]},
+    ]
+}
+
+
+def load_menu(path=MENU_FILE):
+    """Read menu.json -> [{'name', 'items': [{'name', 'path', 'admin'}]}]. Raises on a bad file.
+
+    Format: {"groups": [{"name": "...", "items": [{"name": "...", "path": "...", "runAsAdmin": false}]}]}
+    """
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_MENU, f, indent=2)
+    with open(path, "r", encoding="utf-8-sig") as f:
+        root = json.load(f)
+    if not isinstance(root, dict) or not isinstance(root.get("groups"), list):
+        raise ValueError('top level must be {"groups": [...]}')
+    groups = []
+    for g in root["groups"]:
+        if not isinstance(g, dict) or not g.get("name"):
+            continue
+        items = [
+            {"name": str(it["name"]), "path": str(it.get("path", "")), "admin": bool(it.get("runAsAdmin"))}
+            for it in g.get("items") or [] if isinstance(it, dict) and it.get("name")
+        ]
+        groups.append({"name": str(g["name"]), "items": items})
+    return groups
+
+
+def _split_command(cmd):
+    """'"C:\\a b\\x.exe" args' -> ('C:\\a b\\x.exe', 'args')."""
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        if end != -1:
+            return cmd[1:end], cmd[end + 1:].strip()
+    file, _, params = cmd.partition(" ")
+    return file, params.strip()
+
+
+def _resolve_wildcard(path):
+    """Expand one '*' path segment, e.g. ...\\WindowsApps\\Claude_*_x64__abc\\app\\claude.exe.
+
+    Store-app folders embed a version that changes on every update. WindowsApps itself
+    cannot be listed without elevation, so those are looked up in the per-user package
+    registry instead; anything else is a plain directory match.
+    """
+    parts = path.split("\\")
+    idx = next((i for i, seg in enumerate(parts) if "*" in seg), None)
+    if idx is None or idx == 0:
+        return path
+    before, pattern, after = "\\".join(parts[:idx]), parts[idx], parts[idx + 1:]
+    if before.lower().endswith("windowsapps") and winreg:
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CLASSES_ROOT,
+                r"Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages")
+            for i in range(winreg.QueryInfoKey(key)[0]):
+                name = winreg.EnumKey(key, i)
+                if fnmatch.fnmatch(name.lower(), pattern.lower()):
+                    with winreg.OpenKey(key, name) as pkg:
+                        root, _ = winreg.QueryValueEx(pkg, "PackageRootFolder")
+                    return "\\".join([root] + after)
+        except OSError:
+            pass
+    matches = glob.glob(before + "\\" + pattern)
+    return "\\".join([matches[0]] + after) if matches else path
+
+
+def launch_command(cmd, admin=False):
+    """Run one menu entry: an exe with arguments, a shell:/ms- link, a URL or a document."""
+    cmd = os.path.expandvars((cmd or "").strip())
+    if not cmd:
+        return
+    shell_execute = ctypes.windll.shell32.ShellExecuteW
+    if not admin and (cmd.startswith(("shell:", "ms-")) or "explorer.exe" in cmd.lower() or "!" in cmd):
+        shell_execute(None, "open", cmd, None, None, 1)
+        return
+    file, params = _split_command(cmd)
+    if "*" in file:
+        file = _resolve_wildcard(file)
+    if admin:
+        shell_execute(None, "runas", file, params or None, None, 1)  # UAC prompt
+        return
+    try:
+        subprocess.Popen(f'"{file}" {params}'.strip(), cwd=os.path.dirname(file) or None)
+    except OSError:
+        # Not an executable (URL, document, shortcut): let the shell decide what opens it
+        shell_execute(None, "open", file, params or None, None, 1)
+
+
+APP_NAMES = {"msedge": "Microsoft Edge", "chrome": "Google Chrome", "firefox": "Firefox", "vlc": "VLC",
+             "spotify": "Spotify", "brave": "Brave", "opera": "Opera", "wmplayer": "Media Player"}
+
+
+def pretty_app(app_id):
+    """'MSEdge' / 'SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify' / 'vlc.exe' -> a readable name."""
+    name = (app_id or "").split("!")[-1]
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    name = name.split(".")[-1]
+    return APP_NAMES.get(name.lower(), name[:1].upper() + name[1:])
+
+
+class SpectrumWorker(threading.Thread):
+    """Real spectrum of whatever the PC is playing: loopback-captures the default
+    output device, FFTs it and publishes one 0..1 level per log-spaced band.
+
+    Optional (needs numpy + soundcard, both imported on this thread only). Captures
+    only while `active`, i.e. while something is audibly playing. A daemon thread:
+    the capture call can block during silence and must never hold up quitting.
+    """
+    BANDS = 48
+    RATE = 48000
+    BLOCK = 1024          # ~21 ms of audio per update
+    FFT = 4096            # longer window = bass notes resolve into separate bars
+    F_LO, F_HI = 50.0, 16000.0
+    RANGE_DB = 38.0       # bar height spans this much below the recent loudest band
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.active = False
+        self.available = False
+        self._quit = threading.Event()
+        self._bands = None
+        self._stamp = 0.0
+
+    def read(self):
+        """Latest band levels, or None when no fresh capture exists."""
+        if self._bands is None or time.monotonic() - self._stamp > 0.3:
+            return None
+        return self._bands
+
+    def stop(self):
+        self._quit.set()
+
+    def run(self):
+        try:
+            import numpy as np
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                import soundcard as sc
+        except Exception:
+            return
+        self.available = True
+        warnings.filterwarnings("ignore", module="soundcard")
+
+        # Band edges: equal steps in pitch (log frequency), each at least one FFT bin wide
+        freqs = np.geomspace(self.F_LO, self.F_HI, self.BANDS + 1)
+        bins = np.maximum(1, np.round(freqs * self.FFT / self.RATE).astype(int))
+        for i in range(1, len(bins)):
+            bins[i] = max(bins[i], bins[i - 1] + 1)
+        starts = bins[:-1]
+        # Music carries far less energy up high (roughly -3 dB per octave); lifting the
+        # treble by that slope lets the whole row move instead of only the bass end
+        tilt = (np.sqrt(freqs[:-1] * freqs[1:]) / 1000.0) ** 0.5
+        window = np.hanning(self.FFT)
+        floor_db = 20 * np.log10(self.FFT / 4) - 58   # ignore anything quieter than about -58 dBFS
+
+        while not self._quit.is_set():
+            if not self.active:
+                time.sleep(0.1)
+                continue
+            try:
+                speaker = sc.default_speaker()
+                mic = sc.get_microphone(speaker.id, include_loopback=True)
+                buf = np.zeros(self.FFT)
+                ref = floor_db + self.RANGE_DB
+                checked = time.monotonic()
+                with mic.recorder(samplerate=self.RATE, blocksize=self.BLOCK) as rec:
+                    while self.active and not self._quit.is_set():
+                        data = rec.record(numframes=self.BLOCK)
+                        buf = np.concatenate((buf[self.BLOCK:], data.mean(axis=1)))
+                        mag = np.abs(np.fft.rfft(buf * window))
+                        band = np.maximum.reduceat(mag[:bins[-1]], starts) * tilt
+                        db = 20 * np.log10(band + 1e-9)
+                        # Auto-gain: follow the loudest band up at once, come down slowly
+                        ref = max(float(db.max()), ref - 0.04, floor_db + self.RANGE_DB)
+                        self._bands = np.clip((db - (ref - self.RANGE_DB)) / self.RANGE_DB, 0.0, 1.0).tolist()
+                        self._stamp = time.monotonic()
+                        if self._stamp - checked > 3.0:   # headphones plugged in / output switched
+                            checked = self._stamp
+                            if sc.default_speaker().id != speaker.id:
+                                break
+            except Exception:
+                time.sleep(1.0)
+
+
+class MediaInfoWorker(QThread):
+    """Now-playing details (title, artist, cover art) from the Windows media session -
+    the same source as the volume flyout - plus transport commands sent to that session.
+
+    Optional: without the winrt packages the Media page falls back to naming the app.
+    winrt is imported on this thread only, so it cannot disturb the UI thread's COM setup.
+    """
+    info = pyqtSignal(object)   # None, or dict(app, title, artist, playing, art)
+    COMMANDS = {"toggle": "try_toggle_play_pause_async", "next": "try_skip_next_async",
+                "prev": "try_skip_previous_async"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop_evt = threading.Event()
+        self._cmds = queue.Queue()
+        self.available = False   # True once a session manager was obtained
+
+    def command(self, name):
+        self._cmds.put(name)
+
+    def stop(self):
+        self._stop_evt.set()
+        if not self.wait(2500):  # stuck inside a Windows call: never leave a QThread running
+            self.terminate()
+            self.wait(500)
+
+    def run(self):
+        try:
+            import asyncio
+            from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as Manager
+            from winrt.windows.storage.streams import Buffer, InputStreamOptions
+        except Exception:
+            return
+        try:
+            asyncio.run(self._main(asyncio, Manager, Buffer, InputStreamOptions))
+        except Exception:
+            pass
+
+    async def _main(self, asyncio, Manager, Buffer, InputStreamOptions):
+        mgr = await Manager.request_async()
+        self.available = True
+
+        async def read_art(props):
+            try:
+                if props.thumbnail is None:
+                    return b""
+                stream = await props.thumbnail.open_read_async()
+                buf = Buffer(stream.size)
+                await stream.read_async(buf, stream.size, InputStreamOptions.NONE)
+                return bytes(memoryview(buf))[:buf.length]
+            except Exception:
+                return b""
+
+        track, art, art_tries, sent, ticks = None, b"", 0, "unset", 0
+        while not self._stop_evt.is_set():
+            acted = False
+            try:
+                session = mgr.get_current_session()
+                while not self._cmds.empty():
+                    name = self._cmds.get_nowait()
+                    if session is not None:
+                        await getattr(session, self.COMMANDS[name])()
+                        acted = True
+                if ticks % 4 == 0 or acted:
+                    state = None
+                    if session is not None:
+                        props = await session.try_get_media_properties_async()
+                        key = (session.source_app_user_model_id, props.title, props.artist)
+                        if key != track:
+                            track, art, art_tries = key, b"", 0
+                        if not art and art_tries < 4:   # browsers publish the cover a moment after the title
+                            art_tries += 1
+                            art = await read_art(props)
+                        if props.title:
+                            state = {"app": pretty_app(key[0]), "title": props.title, "artist": props.artist,
+                                     "playing": int(session.get_playback_info().playback_status) == 4,
+                                     "art": art}
+                    if state != sent:
+                        sent = state
+                        self.info.emit(state)
+            except Exception:
+                pass
+            ticks += 1
+            await asyncio.sleep(0.25)
 
 
 def gpu_stats():
@@ -585,17 +912,23 @@ VK_NEXT, VK_PREV, VK_PLAY = 0xB0, 0xB1, 0xB3
 
 # ───────────────────────── Spring physics ─────────────────────────
 class Spring:
-    def __init__(self, value, stiffness=300.0, damping_ratio=0.74):
+    def __init__(self, value, stiffness=300.0, damping_ratio=0.74, eps=0.05):
         self.x = self.target = float(value)
         self.v = 0.0
         self.k = stiffness
         self.c = 2 * damping_ratio * math.sqrt(stiffness)
+        self.eps = eps  # closer than this (and nearly still) counts as arrived
 
     def step(self, dt):
-        a = self.k * (self.target - self.x) - self.c * self.v
-        self.v += a * dt
-        self.x += self.v * dt
-        if abs(self.target - self.x) < 0.05 and abs(self.v) < 0.05:
+        # Integrate in slices of at most 4 ms: one long frame then moves exactly as far
+        # as several short ones would, instead of lurching (or overshooting) on a hiccup.
+        n = max(1, math.ceil(dt / 0.004))
+        h = dt / n
+        for _ in range(n):
+            a = self.k * (self.target - self.x) - self.c * self.v
+            self.v += a * h
+            self.x += self.v * h
+        if abs(self.target - self.x) < self.eps and abs(self.v) < self.eps * 20:
             self.x, self.v = self.target, 0.0
             return False
         return True
@@ -708,6 +1041,13 @@ def draw_icon(p: QPainter, name: str, r: QRectF, color: QColor, stroke=1.8):
     elif name == "close":
         p.drawLine(P(0.28, 0.28), P(0.72, 0.72))
         p.drawLine(P(0.72, 0.28), P(0.28, 0.72))
+    elif name == "disk":
+        p.drawRoundedRect(R(0.14, 0.22, 0.72, 0.56), w * 0.1, w * 0.1)
+        p.drawLine(P(0.14, 0.56), P(0.86, 0.56))
+        p.drawPoint(P(0.7, 0.67))
+    elif name == "reload":
+        p.drawArc(R(0.2, 0.2, 0.6, 0.6), 70 * 16, 270 * 16)
+        p.drawLine(P(0.62, 0.06), P(0.62, 0.24)); p.drawLine(P(0.62, 0.24), P(0.44, 0.24))
     elif name == "plus":
         p.drawLine(P(0.5, 0.22), P(0.5, 0.78))
         p.drawLine(P(0.22, 0.5), P(0.78, 0.5))
@@ -751,7 +1091,7 @@ def draw_icon(p: QPainter, name: str, r: QRectF, color: QColor, stroke=1.8):
         p.drawEllipse(R(0.18, 0.18, 0.64, 0.64))
         p.drawLine(P(0.18, 0.5), P(0.82, 0.5))
         p.drawEllipse(R(0.33, 0.18, 0.34, 0.64))
-    elif name in ("spark", "ai"):
+    elif name == "spark":
         fill()
         path.moveTo(P(0.5, 0.16))
         path.quadTo(P(0.5, 0.5), P(0.84, 0.5))
@@ -776,8 +1116,9 @@ class IconButton(QAbstractButton):
         self._hover = False
 
     def set_icon(self, name):
-        self.icon_name = name
-        self.update()
+        if name != self.icon_name:
+            self.icon_name = name
+            self.update()
 
     def enterEvent(self, e): self._hover = True; self.update()
     def leaveEvent(self, e): self._hover = False; self.update()
@@ -854,11 +1195,11 @@ class TileButton(QAbstractButton):
         if self._hover:
             p.setBrush(QColor(255, 255, 255, 18))
             p.drawRoundedRect(r, 20, 20)
-        draw_icon(p, self.icon_name, QRectF(r.center().x() - 10, r.y() + 12, 20, 20),
+        draw_icon(p, self.icon_name, QRectF(r.center().x() - 10, r.y() + 12 + (self.height() - 64) / 2, 20, 20),
                   M3.PRIMARY if self.active else self.accent)
         p.setPen(M3.ON_SURFACE)
         p.setFont(font(11, QFont.Weight.DemiBold))
-        p.drawText(QRectF(r.x(), r.y() + 38, r.width(), 16), Qt.AlignmentFlag.AlignCenter, self.label)
+        p.drawText(QRectF(r.x(), r.y() + 38 + (self.height() - 64) / 2, r.width(), 16), Qt.AlignmentFlag.AlignCenter, self.label)
 
 
 class AddTileButton(QAbstractButton):
@@ -882,11 +1223,11 @@ class AddTileButton(QAbstractButton):
         p.setPen(QPen(QColor(255, 255, 255, 45 if self._hover else 25), 1, Qt.PenStyle.DashLine))
         p.setBrush(QColor(255, 255, 255, 14 if self._hover else 6))
         p.drawRoundedRect(r, 20, 20)
-        draw_icon(p, "plus", QRectF(r.center().x() - 9, r.y() + 13, 18, 18),
+        draw_icon(p, "plus", QRectF(r.center().x() - 9, r.y() + 13 + (self.height() - 64) / 2, 18, 18),
                   M3.PRIMARY if self._hover else M3.MUTED)
         p.setPen(M3.PRIMARY if self._hover else M3.MUTED)
         p.setFont(font(11, QFont.Weight.DemiBold))
-        p.drawText(QRectF(r.x(), r.y() + 38, r.width(), 16), Qt.AlignmentFlag.AlignCenter, "Add")
+        p.drawText(QRectF(r.x(), r.y() + 38 + (self.height() - 64) / 2, r.width(), 16), Qt.AlignmentFlag.AlignCenter, "Add")
 
 
 class Chip(QAbstractButton):
@@ -913,7 +1254,8 @@ class Chip(QAbstractButton):
             p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
         p.setPen(M3.ON_PRIMARY if self.selected else M3.ON_SURFACE)
         p.setFont(font(12, QFont.Weight.DemiBold))
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text_)
+        text = p.fontMetrics().elidedText(self.text_, Qt.TextElideMode.ElideRight, int(r.width()) - 8)
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, text)
 
 
 class SegmentedTabs(QWidget):
@@ -931,11 +1273,15 @@ class SegmentedTabs(QWidget):
     def set_index(self, i):
         self.index = i
         self.ind.target = i
+        self.update()
         self.changed.emit(i)
 
     def tick(self, dt):
+        """Advance the indicator; True while it is still moving."""
         if self.ind.step(dt):
             self.update()
+            return True
+        return False
 
     def mousePressEvent(self, e):
         seg = self.width() / len(self.labels)
@@ -959,44 +1305,56 @@ class SegmentedTabs(QWidget):
 
 
 class RingGauge(QWidget):
-    """Circular M3 gauge with eased value."""
-    def __init__(self, icon, label, color, parent=None):
+    """Circular M3 gauge with eased value. The ring shrinks with the widget width,
+    so more gauges can share the row. `text` replaces the default "NN%" readout."""
+    def __init__(self, icon, label, color=None, width=96, parent=None):
         super().__init__(parent)
         self.icon_name, self.label, self.color = icon, label, color
         self.value = Spring(0, stiffness=120, damping_ratio=1.0)
         self.sub = ""
-        self.setFixedSize(96, 118)
+        self.text = None
+        self.setFixedSize(width, 118)
 
-    def set_value(self, v, sub=""):
+    def set_value(self, v, sub="", text=None):
         self.value.target = max(0, min(100, v))
-        self.sub = sub
+        if sub != self.sub or text != self.text:
+            self.sub, self.text = sub, text
+            self.update()
 
     def tick(self, dt):
+        """Advance the eased value; True while it is still moving."""
         if self.value.step(dt):
             self.update()
+            return True
+        return False
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        d = 76
+        d = max(40, min(76, self.width() - 12))
+        k = d / 76
+        color = self.color or M3.PRIMARY
+        stroke = max(5.0, 7 * k)
         rr = QRectF((self.width() - d) / 2, 4, d, d)
-        p.setPen(QPen(M3.SURFACE_2, 7, cap=Qt.PenCapStyle.RoundCap))
+        p.setPen(QPen(M3.SURFACE_2, stroke, cap=Qt.PenCapStyle.RoundCap))
         p.drawArc(rr, 0, 360 * 16)
         span = int(-self.value.x / 100 * 360 * 16)
         if span:
-            p.setPen(QPen(self.color, 7, cap=Qt.PenCapStyle.RoundCap))
+            p.setPen(QPen(color, stroke, cap=Qt.PenCapStyle.RoundCap))
             p.drawArc(rr, 90 * 16, span)
-        draw_icon(p, self.icon_name, QRectF(rr.center().x() - 8, rr.y() + 17, 16, 16), self.color, 1.6)
+        ic = 16 * k
+        draw_icon(p, self.icon_name, QRectF(rr.center().x() - ic / 2, rr.y() + 17 * k, ic, ic), color, 1.6)
         p.setPen(M3.ON_SURFACE)
-        p.setFont(font(15, QFont.Weight.Bold))
-        p.drawText(QRectF(rr.x(), rr.y() + 36, d, 22), Qt.AlignmentFlag.AlignCenter, f"{int(round(self.value.x))}%")
+        p.setFont(font(max(11, round(15 * k)), QFont.Weight.Bold))
+        text = self.text if self.text is not None else f"{int(round(self.value.x))}%"
+        p.drawText(QRectF(rr.x(), rr.y() + 36 * k, d, 22 * k), Qt.AlignmentFlag.AlignCenter, text)
         p.setPen(M3.ON_SURFACE_VAR)
         p.setFont(font(11, QFont.Weight.DemiBold))
-        p.drawText(QRectF(0, 86, self.width(), 16), Qt.AlignmentFlag.AlignCenter, self.label)
+        p.drawText(QRectF(0, d + 10, self.width(), 16), Qt.AlignmentFlag.AlignCenter, self.label)
         if self.sub:
             p.setPen(M3.MUTED)
             p.setFont(font(10))
-            p.drawText(QRectF(0, 101, self.width(), 14), Qt.AlignmentFlag.AlignCenter, self.sub)
+            p.drawText(QRectF(0, d + 25, self.width(), 14), Qt.AlignmentFlag.AlignCenter, self.sub)
 
 
 class AlbumArt(QWidget):
@@ -1006,16 +1364,41 @@ class AlbumArt(QWidget):
         self.setFixedSize(64, 64)
         self.phase = 0.0
         self.playing = False
+        self.cover = None
+        self._art = b""
+
+    def set_art(self, data):
+        """Cover image bytes from the media session (b'' = back to the gradient)."""
+        if data == self._art:
+            return
+        self._art = data
+        pm = QPixmap()
+        self.cover = pm if data and pm.loadFromData(data) else None
+        self.update()
 
     def tick(self, dt):
-        if self.playing:
+        animate = self.playing and self.cover is None
+        if animate:
             self.phase += dt * 0.8
             self.update()
+        return animate
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect())
+        if self.cover is not None:
+            clip = QPainterPath()
+            clip.addRoundedRect(r, 18, 18)
+            p.setClipPath(clip)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            pm = self.cover.scaled(self.size() * self.devicePixelRatioF(),
+                                   Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+            src = QRectF(0, 0, r.width() * self.devicePixelRatioF(), r.height() * self.devicePixelRatioF())
+            src.moveCenter(QRectF(pm.rect()).center())
+            p.drawPixmap(r, pm, src)
+            return
         a = self.phase
         g = QLinearGradient(QPointF(32 + 32 * math.cos(a), 32 + 32 * math.sin(a)),
                             QPointF(32 - 32 * math.cos(a), 32 - 32 * math.sin(a)))
@@ -1029,54 +1412,97 @@ class AlbumArt(QWidget):
 
 
 class Waveform(QWidget):
-    """Material Capsule style bouncing bars with fluid organic harmonics and peak reaction."""
-    def __init__(self, bars=28, parent=None):
+    """Spectrum analyser: one bar per frequency band, bass on the left, with falling
+    peak markers. Fed by SpectrumWorker (the real sound); without it the bars fall back
+    to a synthetic wave driven by overall loudness."""
+    def __init__(self, bars=48, parent=None):
         super().__init__(parent)
         self.n = bars
-        self.levels = [0.1] * bars
-        self.targets = [0.1] * bars
+        self.levels = [0.0] * bars
+        self.peaks = [0.0] * bars
         self.energy = 0.0
         self.active = False
+        self.spectrum = None   # SpectrumWorker, set by the capsule
         self.phase = 0.0
-        self.setFixedHeight(30)
+        self.setFixedHeight(44)
+
+    def _targets(self, dt):
+        if not self.active:
+            return [0.0] * self.n
+        live = self.spectrum.read() if self.spectrum else None
+        if live and len(live) == self.n:
+            return live
+        # No capture available: harmonic wave modulated by the sound peak
+        self.phase += dt * 5.0
+        out = []
+        for i in range(self.n):
+            harmonic = 0.35 * math.sin(self.phase + i * 0.45) + 0.25 * math.sin(self.phase * 1.6 - i * 0.3)
+            out.append(min(1.0, 0.12 + max(0.0, harmonic) * (0.3 + self.energy * 0.9)))
+        return out
 
     def tick(self, dt):
-        self.phase += dt * 5.0
+        """Animate the bars; False once they are flat and silent (nothing to repaint)."""
+        if not self.active and max(self.levels) < 0.004 and max(self.peaks) < 0.004:
+            return False
+        targets = self._targets(dt)
         for i in range(self.n):
-            if self.active:
-                # Harmonic wave pattern modulated by real sound peak
-                harmonic = 0.35 * math.sin(self.phase + i * 0.45) + 0.25 * math.sin(self.phase * 1.6 - i * 0.3)
-                base = 0.18 + max(0.0, harmonic) * (0.3 + self.energy * 0.9)
-                if random.random() < 0.25:
-                    jitter = random.random() * (0.2 + self.energy * 0.5)
-                    self.targets[i] = min(1.0, base + jitter)
-                else:
-                    self.targets[i] = max(0.1, min(1.0, base))
-            else:
-                self.targets[i] = 0.08
-            self.levels[i] += (self.targets[i] - self.levels[i]) * min(1.0, dt * 18.0)
+            lv, t = self.levels[i], targets[i]
+            # Jump up with the beat, sink back slowly: how a hardware analyser reads
+            lv += (t - lv) * min(1.0, dt * (38.0 if t > lv else 9.0))
+            self.levels[i] = lv
+            self.peaks[i] = max(lv, self.peaks[i] - dt * 0.55)
         self.update()
+        return True
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
         w, h = float(self.width()), float(self.height())
-        gap = 4.0
-        bw = max(2.5, (w - gap * (self.n - 1)) / self.n)
-        
+        gap = 3.0
+        bw = max(2.0, (w - gap * (self.n - 1)) / self.n)
+        rad = min(2.0, bw / 2.0)
+
         g = QLinearGradient(0, 0, w, 0)
         g.setColorAt(0, M3.PRIMARY)
         g.setColorAt(0.5, M3.TERTIARY)
         g.setColorAt(1, M3.PRIMARY)
-        p.setBrush(g if self.active else M3.SURFACE_3)
-        
+        cap = QColor(M3.ON_SURFACE)
+        cap.setAlpha(170)
         for i, lv in enumerate(self.levels):
-            bh = max(4.0, lv * (h - 2.0))
-            x_pos = i * (bw + gap)
-            y_pos = (h - bh) / 2.0
-            p.drawRoundedRect(QRectF(x_pos, y_pos, bw, bh), bw / 2.0, bw / 2.0)
+            x = i * (bw + gap)
+            bh = max(2.0, lv * (h - 4.0))
+            p.setBrush(g if lv > 0.01 else M3.SURFACE_3)
+            p.drawRoundedRect(QRectF(x, h - bh, bw, bh), rad, rad)
+            pk = self.peaks[i]
+            if pk > 0.03 and pk - lv > 0.02:
+                p.setBrush(cap)
+                p.drawRect(QRectF(x, h - 2.0 - pk * (h - 4.0), bw, 2.0))
 
+
+class ElideLabel(QWidget):
+    """Single-line text that is cut with "…" when it does not fit (a QLabel would
+    widen the layout to fit a long song title)."""
+    def __init__(self, text, size, color, weight=QFont.Weight.Normal):
+        super().__init__()
+        self._text, self._font, self._color = text, font(size, weight), color
+        self.setFixedHeight(size + 8)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+    def text(self):
+        return self._text
+
+    def setText(self, text):
+        if text != self._text:
+            self._text = text
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setFont(self._font)
+        p.setPen(self._color)
+        text = p.fontMetrics().elidedText(self._text, Qt.TextElideMode.ElideRight, self.width())
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
 
 
 def label(text, size, color, weight=QFont.Weight.Normal):
@@ -1107,18 +1533,30 @@ class CompactView(QWidget):
         self.bars = [0.3, 0.6, 0.45, 0.8]
         self.bar_t = [0.3, 0.6, 0.45, 0.8]
         self.energy = 0.0
+        self.spectrum = None   # SpectrumWorker, set by the capsule
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setMouseTracking(True)
         self._hover_center = False
 
     def tick(self, dt):
+        """Animate the mini equalizer; False when the bars are at rest (nothing to repaint)."""
+        changed = False
+        live = self.spectrum.read() if (self.playing and self.spectrum) else None
         for i in range(4):
-            if self.playing and random.random() < 0.35:
+            if live:
+                q = len(live) * 3 // 16   # four slices over the lower three quarters, where music lives
+                self.bar_t[i] = 0.2 + 0.8 * max(live[i * q:(i + 1) * q])
+            elif self.playing and random.random() < 0.35:
                 self.bar_t[i] = 0.2 + random.random() * min(0.8, 0.25 + self.energy * 2.2)
             elif not self.playing:
                 self.bar_t[i] = 0.2
-            self.bars[i] += (self.bar_t[i] - self.bars[i]) * min(1.0, dt * 16.0)
-        self.update()
+            step = (self.bar_t[i] - self.bars[i]) * min(1.0, dt * 16.0)
+            if abs(step) > 0.002:
+                self.bars[i] += step
+                changed = True
+        if changed:
+            self.update()
+        return self.playing or changed
 
     def badge_rect(self):
         h = self.height()
@@ -1259,8 +1697,8 @@ class MediaPage(QWidget):
         info = QVBoxLayout()
         info.setSpacing(2)
         info.addStretch()
-        self.title = label("Nothing playing", 16, M3.ON_SURFACE, QFont.Weight.Bold)
-        self.sub = label("Play something to see it here", 12, M3.MUTED)
+        self.title = ElideLabel("Nothing playing", 16, M3.ON_SURFACE, QFont.Weight.Bold)
+        self.sub = ElideLabel("Play something to see it here", 12, M3.MUTED)
         info.addWidget(self.title)
         info.addWidget(self.sub)
         info.addStretch()
@@ -1271,15 +1709,15 @@ class MediaPage(QWidget):
         self.btn_prev = IconButton("prev", 38, 15)
         self.btn_play = IconButton("play", 46, 18, filled=True)
         self.btn_next = IconButton("next", 38, 15)
-        self.btn_prev.clicked.connect(lambda: media_key(VK_PREV))
+        self.btn_prev.clicked.connect(lambda: island.media_cmd("prev"))
         self.btn_play.clicked.connect(island.toggle_play)
-        self.btn_next.clicked.connect(lambda: media_key(VK_NEXT))
+        self.btn_next.clicked.connect(lambda: island.media_cmd("next"))
         for b in (self.btn_prev, self.btn_play, self.btn_next):
             ctrls.addWidget(b, 0, Qt.AlignmentFlag.AlignVCenter)
         top.addLayout(ctrls)
         root.addLayout(top)
 
-        self.wave = Waveform(30)
+        self.wave = Waveform(SpectrumWorker.BANDS)
         root.addWidget(self.wave)
 
         vol = QHBoxLayout()
@@ -1311,28 +1749,141 @@ class MediaPage(QWidget):
         self.vol_lbl.setText(f"{v}%")
 
     def tick(self, dt):
-        self.art.tick(dt)
-        self.wave.tick(dt)
+        return self.art.tick(dt) | self.wave.tick(dt)
+
+
+class NetStrip(QWidget):
+    """Two-line network readout: UL / DL speed, a 60-second histogram for each,
+    and the LAN / WAN addresses (WAN tinted by VPN state when that option is on)."""
+    UP_COLOR = QColor(0x6F, 0xD8, 0xF5)     # cyan / amber: off the red-green axis,
+    DOWN_COLOR = QColor(0xF5, 0xC0, 0x4A)   # which is reserved for the VPN state
+    VPN_ON = QColor(74, 222, 128)
+    VPN_OFF = QColor(255, 95, 95)
+    ROW_H = 21
+
+    def __init__(self, island):
+        super().__init__()
+        self.island = island
+        self.show_graph = True
+        self.show_ips = False
+        self.setFixedHeight(50)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(M3.SURFACE_1)
+        p.drawRoundedRect(QRectF(self.rect()), 14, 14)
+
+        net = self.island.net
+        wan_color = M3.ON_SURFACE
+        if self.island.settings.get("wan_vpn_color", True):
+            wan_color = self.VPN_ON if net.vpn else self.VPN_OFF
+        rows = (
+            ("UL", net.up, net.hist_up, self.UP_COLOR, "LAN", net.lan_ip or "—", M3.ON_SURFACE),
+            ("DL", net.down, net.hist_down, self.DOWN_COLOR, "WAN", self.island.wan_ip or "…", wan_color),
+        )
+        ip_w = 150 if self.show_ips else 0
+        gx0, gx1 = 122.0, w - 12.0 - (ip_w + 12 if ip_w else 0)
+        V = Qt.AlignmentFlag.AlignVCenter
+        for i, (tag, rate, hist, color, ip_tag, ip, ip_color) in enumerate(rows):
+            y = 4 + i * self.ROW_H
+            p.setPen(color)
+            p.setFont(font(10, QFont.Weight.Bold))
+            p.drawText(QRectF(12, y, 22, self.ROW_H), V | Qt.AlignmentFlag.AlignLeft, tag)
+            num, unit = fmt_rate(rate)
+            p.setPen(M3.ON_SURFACE)
+            p.setFont(mono(12, QFont.Weight.DemiBold))
+            p.drawText(QRectF(32, y, 46, self.ROW_H), V | Qt.AlignmentFlag.AlignRight, num)
+            p.setPen(M3.MUTED)
+            p.setFont(font(10))
+            p.drawText(QRectF(83, y, 36, self.ROW_H), V | Qt.AlignmentFlag.AlignLeft, unit)
+
+            if self.show_graph and gx1 - gx0 > 40:
+                # Each series scales to its own recent peak, so a small upload stays readable
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+                p.setPen(Qt.PenStyle.NoPen)
+                pitch = (gx1 - gx0) / len(hist)
+                peak = max(NetMeter.MIN_SCALE, max(hist))
+                base = y + self.ROW_H - 3
+                p.setBrush(M3.SURFACE_3)
+                p.drawRect(QRectF(gx0, base, gx1 - gx0, 1))
+                p.setBrush(color)
+                for n, v in enumerate(hist):
+                    if v > 0:
+                        bh = max(1.0, v / peak * (self.ROW_H - 6))
+                        p.drawRect(QRectF(gx0 + n * pitch, base - bh, max(1.0, pitch - 1), bh))
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            if ip_w:
+                x = w - 12 - ip_w
+                p.setPen(ip_color if ip_tag == "WAN" else M3.MUTED)
+                p.setFont(font(10, QFont.Weight.Bold))
+                p.drawText(QRectF(x, y, 30, self.ROW_H), V | Qt.AlignmentFlag.AlignLeft, ip_tag)
+                p.setPen(ip_color)
+                p.setFont(mono(12))
+                p.drawText(QRectF(x + 30, y, ip_w - 30, self.ROW_H), V | Qt.AlignmentFlag.AlignRight, ip)
 
 
 class SystemPage(QWidget):
-    def __init__(self):
+    """One ring gauge per enabled monitor plus the network strip (see MONITORS);
+    rebuilt when the selection changes."""
+    ROW_W = 504  # panel width minus its padding
+
+    def __init__(self, island):
         super().__init__()
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 2, 0, 0)
-        lay.setSpacing(0)
-        self.cpu = RingGauge("cpu", "CPU", M3.PRIMARY)
-        self.ram = RingGauge("ram", "Memory", M3.GREEN)
-        self.gpu = RingGauge("gpu", "GPU", M3.NVIDIA)
-        self.bat = RingGauge("battery", "Battery", M3.ORANGE)
-        for g in (self.cpu, self.ram, self.gpu, self.bat):
-            lay.addStretch()
-            lay.addWidget(g, 0, Qt.AlignmentFlag.AlignTop)
-        lay.addStretch()
+        self.island = island
+        self.gauges = {}
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 2, 0, 0)
+        root.setSpacing(2)
+        self.lay = QHBoxLayout()
+        self.lay.setSpacing(0)
+        root.addLayout(self.lay)
+        self.strip = NetStrip(island)
+        root.addWidget(self.strip)
+        root.addStretch()
+        self.rebuild()
+
+    def rebuild(self):
+        while self.lay.count():
+            w = self.lay.takeAt(0).widget()
+            if w:
+                w.hide()
+                w.deleteLater()
+        self.gauges = {}
+        ids = self.island.get_monitors()
+        self.strip.show_graph = "net_graph" in ids
+        self.strip.show_ips = "ips" in ids
+        self.strip.setVisible(self.strip.show_graph or self.strip.show_ips)
+        if not ids:
+            hint = label("No monitors selected  ·  right-click → Monitors", 12, M3.MUTED)
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.lay.addWidget(hint, 1)
+            return
+        gauge_ids = [m for m in ids if MONITORS[m][1]]
+        if not gauge_ids:
+            return
+        width = max(64, min(96, self.ROW_W // len(gauge_ids)))
+        for mid in gauge_ids:
+            title, icon, color = MONITORS[mid]
+            g = RingGauge(icon, title, color, width)
+            self.lay.addStretch()
+            self.lay.addWidget(g, 0, Qt.AlignmentFlag.AlignTop)
+            self.gauges[mid] = g
+        self.lay.addStretch()
+
+    def set(self, mid, v, sub="", text=None):
+        g = self.gauges.get(mid)
+        if g:
+            g.set_value(v, sub, text)
 
     def tick(self, dt):
-        for g in (self.cpu, self.ram, self.gpu, self.bat):
-            g.tick(dt)
+        moving = False
+        for g in self.gauges.values():
+            moving |= g.tick(dt)
+        return moving
 
 
 class ToolsPage(QWidget):
@@ -1350,7 +1901,7 @@ class ToolsPage(QWidget):
         self.grid.setSpacing(8)
         self.root_lay.addLayout(self.grid)
 
-        clip = QWidget()
+        clip = self.clip = QWidget()
         clip.setFixedHeight(48)
         clip.setStyleSheet(f"background: {M3.SURFACE_1.name()}; border-radius: 16px;")
         cl = QHBoxLayout(clip)
@@ -1408,6 +1959,14 @@ class ToolsPage(QWidget):
         col = idx % cols
         self.grid.addWidget(add_btn, row, col)
 
+        # Two rows of full-size tiles do not fit above the clipboard bar at the
+        # default panel height, so a second row makes everything slightly shorter.
+        two_rows = row >= 1
+        for t in self.tiles + [add_btn]:
+            t.setFixedHeight(56 if two_rows else 64)
+        self.clip.setFixedHeight(40 if two_rows else 48)
+        self.root_lay.setSpacing(8 if two_rows else 10)
+
     def set_clip(self, text):
         fm = self.clip_text.fontMetrics()
         self.clip_text.setText(fm.elidedText(text.replace("\n", " "), Qt.TextElideMode.ElideRight, 360))
@@ -1424,6 +1983,8 @@ class FocusRing(QWidget):
     def tick(self, dt):
         if self.progress.step(dt):
             self.update()
+            return True
+        return False
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -1474,189 +2035,84 @@ class FocusPage(QWidget):
         lay.addLayout(right, 1)
 
 
-class AIPage(QWidget):
-    """
-    Asynchronous Streaming AI Assistant page.
-    Features optimistic UI feedback, instant streaming rendering, request cancellation,
-    and thread-safe state synchronization.
-    """
+class AppsPage(QWidget):
+    """Launcher driven by menu.json: a row of groups, the chosen group's entries below."""
     def __init__(self, island):
         super().__init__()
         self.island = island
-        self.worker = None
+        self.group = 0
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 4, 10, 4)
-        lay.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(4)
+        self.groups_lay = QHBoxLayout()
+        self.groups_lay.setSpacing(4)
+        top.addLayout(self.groups_lay, 1)
+        btn_edit = IconButton("note", 26, 13)
+        btn_edit.setToolTip("Edit menu file")
+        btn_edit.clicked.connect(island.edit_menu)
+        btn_reload = IconButton("reload", 26, 13)
+        btn_reload.setToolTip("Reload menu file")
+        btn_reload.clicked.connect(lambda: island.reload_menu(True))
+        top.addWidget(btn_edit)
+        top.addWidget(btn_reload)
+        root.addLayout(top)
 
-        # Status & header bar
-        hdr = QHBoxLayout()
-        hdr.setSpacing(6)
-        lbl_head = label("AI ASSISTANT", 11, M3.PRIMARY, QFont.Weight.Bold)
-        hdr.addWidget(lbl_head)
-        self.lbl_status = label("Ready", 11, M3.MUTED)
-        hdr.addWidget(self.lbl_status)
-        hdr.addStretch()
-
-        self.btn_cancel = QPushButton("Stop")
-        self.btn_cancel.setFont(font(10, QFont.Weight.DemiBold))
-        self.btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_cancel.setVisible(False)
-        self.btn_cancel.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba(255, 80, 80, 0.2);
-                color: #FF8080;
-                border: 1px solid rgba(255, 80, 80, 0.3);
-                border-radius: 6px;
-                padding: 2px 8px;
-            }}
-            QPushButton:hover {{ background: rgba(255, 80, 80, 0.4); }}
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical { background: transparent; width: 4px; margin: 0; }
+            QScrollBar::handle:vertical { background: rgba(255, 255, 255, 0.2); border-radius: 2px; min-height: 20px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
         """)
-        self.btn_cancel.clicked.connect(self.cancel_request)
-        hdr.addWidget(self.btn_cancel)
-        lay.addLayout(hdr)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        host = QWidget()
+        host.setStyleSheet("background: transparent;")
+        self.grid = QGridLayout(host)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(6)
+        self.grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(host)
+        root.addWidget(scroll, 1)
+        self.rebuild()
 
-        # Output text area
-        self.output_box = QTextEdit()
-        self.output_box.setReadOnly(True)
-        self.output_box.setPlaceholderText("Ask a question, summarize text, or type a request...")
-        self.output_box.setStyleSheet(f"""
-            QTextEdit {{
-                background: {M3.SURFACE_1.name()};
-                color: {M3.ON_SURFACE.name()};
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-radius: 12px;
-                padding: 8px;
-                font-family: '{FONT}';
-                font-size: 12px;
-            }}
-            QScrollBar:vertical {{
-                background: transparent;
-                width: 4px;
-            }}
-            QScrollBar::handle:vertical {{
-                background: rgba(255, 255, 255, 0.18);
-                border-radius: 2px;
-            }}
-        """)
-        lay.addWidget(self.output_box, 1)
-
-        # Input box and quick action chips
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
-
-        self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Type a prompt and press Enter...")
-        self.input_edit.setStyleSheet(f"""
-            QLineEdit {{
-                background: {M3.SURFACE_2.name()};
-                color: {M3.ON_SURFACE.name()};
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 12px;
-                padding: 6px 12px;
-                font-family: '{FONT}';
-                font-size: 12px;
-            }}
-            QLineEdit:focus {{
-                border: 1px solid {M3.PRIMARY.name()};
-            }}
-        """)
-        self.input_edit.returnPressed.connect(self.send_prompt)
-        input_row.addWidget(self.input_edit, 1)
-
-        self.btn_send = QPushButton("Send")
-        self.btn_send.setFont(font(11, QFont.Weight.DemiBold))
-        self.btn_send.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_send.setStyleSheet(f"""
-            QPushButton {{
-                background: {M3.PRIMARY.name()};
-                color: {M3.ON_PRIMARY.name()};
-                border: none;
-                border-radius: 12px;
-                padding: 6px 14px;
-            }}
-            QPushButton:hover {{ background: #FFFFFF; color: #000000; }}
-            QPushButton:disabled {{ background: {M3.SURFACE_3.name()}; color: {M3.MUTED.name()}; }}
-        """)
-        self.btn_send.clicked.connect(self.send_prompt)
-        input_row.addWidget(self.btn_send)
-        lay.addLayout(input_row)
-
-    def cancel_request(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.cancel()
-            self.lbl_status.setText("Cancelled")
-            self.lbl_status.setStyleSheet(f"color: {M3.MUTED.name()};")
-            self.btn_cancel.setVisible(False)
-            self.btn_send.setEnabled(True)
-            self.island.aura = 0.0
-
-    def send_prompt(self, explicit_prompt: str = None):
-        text = explicit_prompt if explicit_prompt is not None else self.input_edit.text().strip()
-        if not text:
+    def rebuild(self):
+        for lay in (self.groups_lay, self.grid):
+            while lay.count():
+                w = lay.takeAt(0).widget()
+                if w:
+                    w.hide()
+                    w.deleteLater()
+        groups = self.island.menu_groups
+        self.group = max(0, min(self.group, len(groups) - 1))
+        for i, g in enumerate(groups):
+            chip = Chip(g["name"])
+            chip.selected = i == self.group
+            chip.clicked.connect(lambda _, i=i: self.select(i))
+            self.groups_lay.addWidget(chip, 1)
+        items = groups[self.group]["items"] if groups else []
+        if not items:
+            hint = label("Nothing here yet  ·  use the pencil button to edit menu.json", 12, M3.MUTED)
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.grid.addWidget(hint, 0, 0)
             return
+        cols = 3 if len(items) <= 12 else 4
+        for n, item in enumerate(items):
+            btn = Chip(item["name"])
+            btn.setToolTip(item["path"])
+            btn.clicked.connect(lambda _, it=item: self.island.launch_item(it))
+            self.grid.addWidget(btn, n // cols, n % cols)
 
-        self.cancel_request()
-
-        # Immediate optimistic visual feedback
-        self.input_edit.clear()
-        self.output_box.clear()
-        self.lbl_status.setText("Thinking...")
-        self.lbl_status.setStyleSheet(f"color: {M3.PRIMARY.name()};")
-        self.btn_cancel.setVisible(True)
-        self.btn_send.setEnabled(False)
-
-        # Pulse aura on island for immediate optimistic tactile feedback
-        self.island.aura = 1.0
-        self.island.aura_color = M3.PRIMARY
-
-        endpoint = self.island.settings.get("ai_endpoint", "https://api.openai.com/v1/chat/completions")
-        api_key = self.island.settings.get("ai_api_key", "")
-        model = self.island.settings.get("ai_model", "gpt-4o-mini")
-        temp = float(self.island.settings.get("ai_temperature", 0.7))
-
-        self.worker = AIServiceWorker(
-            endpoint=endpoint,
-            api_key=api_key,
-            model=model,
-            prompt=text,
-            temperature=temp,
-            parent=self
-        )
-        self.worker.started_streaming.connect(self._on_started_streaming)
-        self.worker.chunk_received.connect(self._on_chunk)
-        self.worker.response_finished.connect(self._on_finished)
-        self.worker.error_occurred.connect(self._on_error)
-        self.worker.start()
-
-    def _on_started_streaming(self):
-        self.lbl_status.setText("Generating...")
-        self.lbl_status.setStyleSheet(f"color: {M3.GREEN.name()};")
-
-    def _on_chunk(self, chunk: str):
-        self.output_box.moveCursor(self.output_box.textCursor().MoveOperation.End)
-        self.output_box.insertPlainText(chunk)
-        self.output_box.moveCursor(self.output_box.textCursor().MoveOperation.End)
-
-    def _on_finished(self, full_text: str):
-        self.lbl_status.setText("Done")
-        self.lbl_status.setStyleSheet(f"color: {M3.MUTED.name()};")
-        self.btn_cancel.setVisible(False)
-        self.btn_send.setEnabled(True)
-        self.island.aura = 0.0
-
-    def _on_error(self, err_msg: str):
-        self.lbl_status.setText("Error")
-        self.lbl_status.setStyleSheet(f"color: {M3.ERROR.name()};")
-        self.output_box.setPlainText(f"⚠️ {err_msg}")
-        self.btn_cancel.setVisible(False)
-        self.btn_send.setEnabled(True)
-        self.island.aura = 0.6
-        self.island.aura_color = M3.ERROR
+    def select(self, index):
+        self.group = index
+        self.rebuild()
 
 
-
-# ───────────────────────── Settings UI ─────────────────────────
 class ColorChip(QAbstractButton):
     def __init__(self, color_hex, name, parent=None):
         super().__init__(parent)
@@ -1881,6 +2337,37 @@ class SettingsDialog(QWidget):
         btns_layout.addLayout(self.btns_list_layout)
         root.addWidget(grp_btns)
 
+        # ─── Group 0b: System monitors ───
+        grp_mon = QFrame()
+        grp_mon.setStyleSheet(f"background: {M3.SURFACE_2.name()}; border-radius: 14px;")
+        mon_layout = QVBoxLayout(grp_mon)
+        mon_layout.setContentsMargins(14, 12, 14, 12)
+        mon_layout.setSpacing(8)
+
+        lbl_mon = QLabel("SYSTEM MONITORS")
+        lbl_mon.setFont(font(10, QFont.Weight.Bold))
+        lbl_mon.setStyleSheet(f"color: {M3.PRIMARY.name()};")
+        mon_layout.addWidget(lbl_mon)
+
+        mon_grid = QGridLayout()
+        mon_grid.setHorizontalSpacing(12)
+        mon_grid.setVerticalSpacing(8)
+        self.mon_checks = {}
+        for i, mid in enumerate(MONITOR_ORDER):
+            cb = QCheckBox(MONITORS[mid][0])
+            cb.setStyleSheet(f"""
+                QCheckBox {{ color: {M3.ON_SURFACE.name()}; font-family: '{FONT}'; font-size: 12px; spacing: 8px; }}
+                QCheckBox:disabled {{ color: {M3.MUTED.name()}; }}
+                QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px;
+                    background: {M3.SURFACE_3.name()}; border: 1px solid rgba(255, 255, 255, 0.15); }}
+                QCheckBox::indicator:checked {{ background: {M3.PRIMARY.name()}; border-color: {M3.PRIMARY.name()}; }}
+            """)
+            cb.toggled.connect(lambda on, m=mid: self.island.set_monitor(m, on))
+            mon_grid.addWidget(cb, i // 2, i % 2)
+            self.mon_checks[mid] = cb
+        mon_layout.addLayout(mon_grid)
+        root.addWidget(grp_mon)
+
         # ─── Group 1: Geometry & Position ───
         grp_geo = QFrame()
         grp_geo.setStyleSheet(f"background: {M3.SURFACE_2.name()}; border-radius: 14px;")
@@ -1991,13 +2478,13 @@ class SettingsDialog(QWidget):
         r_del_lbl = QLabel("Auto-Collapse Delay")
         r_del_lbl.setFont(font(12, QFont.Weight.DemiBold))
         r_del_lbl.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
-        self.lbl_del_val = QLabel("180 ms")
+        self.lbl_del_val = QLabel("1000 ms")
         self.lbl_del_val.setFont(font(11, QFont.Weight.Normal))
         self.lbl_del_val.setStyleSheet(f"color: {M3.MUTED.name()};")
         r_del.addWidget(r_del_lbl); r_del.addStretch(); r_del.addWidget(self.lbl_del_val)
         beh_layout.addLayout(r_del)
         self.sl_del = QSlider(Qt.Orientation.Horizontal)
-        self.sl_del.setRange(50, 800)
+        self.sl_del.setRange(50, 3000)
         self._style_slider(self.sl_del)
         self.sl_del.valueChanged.connect(self._on_del_changed)
         beh_layout.addWidget(self.sl_del)
@@ -2021,7 +2508,7 @@ class SettingsDialog(QWidget):
                 border-color: {M3.PRIMARY.name()};
             }}
         """
-        self.cb_ontop = QCheckBox("Keep Always on Top")
+        self.cb_ontop = QCheckBox("Always on top  (off = on the desktop, apps cover it)")
         self.cb_ontop.setStyleSheet(cb_style)
         self.cb_ontop.toggled.connect(lambda v: self.island.apply_setting("always_on_top", v))
         beh_layout.addWidget(self.cb_ontop)
@@ -2035,63 +2522,12 @@ class SettingsDialog(QWidget):
         self.cb_toast.setStyleSheet(cb_style)
         self.cb_toast.toggled.connect(lambda v: self.island.apply_setting("clipboard_toast", v))
         beh_layout.addWidget(self.cb_toast)
+
+        self.cb_wan = QCheckBox("Colour the WAN address by VPN  (green = VPN, red = direct)")
+        self.cb_wan.setStyleSheet(cb_style)
+        self.cb_wan.toggled.connect(lambda v: self.island.apply_setting("wan_vpn_color", v))
+        beh_layout.addWidget(self.cb_wan)
         root.addWidget(grp_beh)
-
-        # ─── Group 4: AI Model & API ───
-        grp_ai = QFrame()
-        grp_ai.setStyleSheet(f"background: {M3.SURFACE_2.name()}; border-radius: 14px;")
-        ai_layout = QVBoxLayout(grp_ai)
-        ai_layout.setContentsMargins(14, 12, 14, 12)
-        ai_layout.setSpacing(8)
-
-        lbl_sec4 = QLabel("AI MODEL & INTEGRATION")
-        lbl_sec4.setFont(font(10, QFont.Weight.Bold))
-        lbl_sec4.setStyleSheet(f"color: {M3.PRIMARY.name()};")
-        ai_layout.addWidget(lbl_sec4)
-
-        lbl_ep = QLabel("Endpoint URL (OpenAI / Ollama / Local compatible)")
-        lbl_ep.setFont(font(11, QFont.Weight.DemiBold))
-        lbl_ep.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
-        ai_layout.addWidget(lbl_ep)
-        self.edit_ai_ep = QLineEdit()
-        self.edit_ai_ep.setStyleSheet(f"""
-            QLineEdit {{
-                background: {M3.SURFACE_3.name()}; color: {M3.ON_SURFACE.name()};
-                border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 10px; font-size: 11px;
-            }}
-        """)
-        self.edit_ai_ep.textChanged.connect(lambda v: self.island.apply_setting("ai_endpoint", v))
-        ai_layout.addWidget(self.edit_ai_ep)
-
-        lbl_mod = QLabel("Model Name (e.g., gpt-4o-mini, llama3, mistral)")
-        lbl_mod.setFont(font(11, QFont.Weight.DemiBold))
-        lbl_mod.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
-        ai_layout.addWidget(lbl_mod)
-        self.edit_ai_model = QLineEdit()
-        self.edit_ai_model.setStyleSheet(f"""
-            QLineEdit {{
-                background: {M3.SURFACE_3.name()}; color: {M3.ON_SURFACE.name()};
-                border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 10px; font-size: 11px;
-            }}
-        """)
-        self.edit_ai_model.textChanged.connect(lambda v: self.island.apply_setting("ai_model", v))
-        ai_layout.addWidget(self.edit_ai_model)
-
-        lbl_key = QLabel("API Key (optional for local models)")
-        lbl_key.setFont(font(11, QFont.Weight.DemiBold))
-        lbl_key.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
-        ai_layout.addWidget(lbl_key)
-        self.edit_ai_key = QLineEdit()
-        self.edit_ai_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.edit_ai_key.setStyleSheet(f"""
-            QLineEdit {{
-                background: {M3.SURFACE_3.name()}; color: {M3.ON_SURFACE.name()};
-                border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 10px; font-size: 11px;
-            }}
-        """)
-        self.edit_ai_key.textChanged.connect(lambda v: self.island.apply_setting("ai_api_key", v))
-        ai_layout.addWidget(self.edit_ai_key)
-        root.addWidget(grp_ai)
 
         scroll.setWidget(container)
         main_root.addWidget(scroll, 1)
@@ -2183,7 +2619,7 @@ class SettingsDialog(QWidget):
         self.sl_h.blockSignals(False)
         self.lbl_h_val.setText(f"{h} px")
 
-        delay = int(s.get("collapse_delay", 180))
+        delay = int(s.get("collapse_delay", 1000))
         self.sl_del.blockSignals(True)
         self.sl_del.setValue(delay)
         self.sl_del.blockSignals(False)
@@ -2195,7 +2631,7 @@ class SettingsDialog(QWidget):
             chip.update()
 
         self.cb_ontop.blockSignals(True)
-        self.cb_ontop.setChecked(bool(s.get("always_on_top", True)))
+        self.cb_ontop.setChecked(bool(s.get("always_on_top", False)))
         self.cb_ontop.blockSignals(False)
 
         boot_val = get_windows_autostart()
@@ -2207,22 +2643,24 @@ class SettingsDialog(QWidget):
         self.cb_toast.setChecked(bool(s.get("clipboard_toast", True)))
         self.cb_toast.blockSignals(False)
 
-        if hasattr(self, "edit_ai_ep"):
-            self.edit_ai_ep.blockSignals(True)
-            self.edit_ai_ep.setText(str(s.get("ai_endpoint", "https://api.openai.com/v1/chat/completions")))
-            self.edit_ai_ep.blockSignals(False)
-
-        if hasattr(self, "edit_ai_model"):
-            self.edit_ai_model.blockSignals(True)
-            self.edit_ai_model.setText(str(s.get("ai_model", "gpt-4o-mini")))
-            self.edit_ai_model.blockSignals(False)
-
-        if hasattr(self, "edit_ai_key"):
-            self.edit_ai_key.blockSignals(True)
-            self.edit_ai_key.setText(str(s.get("ai_api_key", "")))
-            self.edit_ai_key.blockSignals(False)
+        self.cb_wan.blockSignals(True)
+        self.cb_wan.setChecked(bool(s.get("wan_vpn_color", True)))
+        self.cb_wan.blockSignals(False)
 
         self.sync_buttons_list()
+        self.sync_monitors()
+
+    def sync_monitors(self):
+        enabled = self.island.get_monitors()
+        for mid, cb in self.mon_checks.items():
+            on = mid in enabled
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+            # Something this PC lacks (e.g. no NVIDIA GPU) can be switched off but not on
+            available = on or monitor_available(mid)
+            cb.setEnabled(available)
+            cb.setText(MONITORS[mid][0] + ("" if available else "  (not on this PC)"))
 
     def sync_buttons_list(self):
         while self.btns_list_layout.count():
@@ -2256,7 +2694,7 @@ class SettingsDialog(QWidget):
             ic = QWidget()
             ic.setFixedSize(22, 22)
             icon_name = b.get("icon", "pulse")
-            def _make_icon_painter(iname):
+            def _make_icon_painter(iname, ic=ic):
                 def _paint(e):
                     p = QPainter(ic)
                     p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -2325,6 +2763,7 @@ class SettingsDialog(QWidget):
 
 # ───────────────────────── The capsule window ─────────────────────────
 class DynamicCapsule(QWidget):
+    wan_ready = pyqtSignal(str)  # emitted from the lookup thread
     WIN_W, WIN_H = 620, 370          # fixed transparent canvas
     TOP = 8
     COMPACT_H = 40
@@ -2346,16 +2785,18 @@ class DynamicCapsule(QWidget):
         flags = (Qt.WindowType.FramelessWindowHint |
                  Qt.WindowType.Tool |
                  Qt.WindowType.NoDropShadowWindowHint)
-        if self.settings.get("always_on_top", True):
+        self._desktop_level = not self.settings.get("always_on_top", False)
+        if not self._desktop_level:
             flags |= Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(self.WIN_W, self.WIN_H)
 
-        # High-performance snappy springs (stiffness 950, damping 0.76 for instant responsive spring)
-        self.sw = Spring(self.W_IDLE, 950, 0.76)
-        self.sh = Spring(self.COMPACT_H, 1050, 0.78)
+        # Width and height share one spring tuning so the pill keeps its shape while it
+        # morphs; damped just short of critical: it glides in and settles with no bounce.
+        self.sw = Spring(self.W_IDLE, 420, 0.9, eps=0.2)
+        self.sh = Spring(self.COMPACT_H, 420, 0.9, eps=0.2)
         self.expanded = False
         self.pinned = False
         self.aura = 0.0
@@ -2367,12 +2808,30 @@ class DynamicCapsule(QWidget):
         self.focus_paused = False
         self.clock_frozen_time = None
         self.toast_until = 0.0
-        cb = QApplication.clipboard()
-        self.last_clip = cb.text() if cb else ""
+        self.last_clip = ""
+        self.net = NetMeter()
+        self._cpu_at = 0.0
+        self._cpu_pct = 0.0
+        self._threads = (psutil.cpu_count() if HAS_PSUTIL else None) or 4
+        self._manual_open = False
+        self._layout_key = None
+        self._quitting = False
+        self.wan_ip = ""
+        self._wan_busy = False
+        self._probe_n = 0
+        self.media_info = None
+        self._peak_ref = 0.05
+        self.menu_groups = []
+        try:
+            self.menu_groups = load_menu()
+        except Exception:
+            pass  # reported by reload_menu once the window exists
 
         self._build()
         self._place()
         try:
+            app = QApplication.instance()
+            app.primaryScreenChanged.connect(self._on_primary_screen)  # dock / undock / projector
             screen = QApplication.primaryScreen()
             if screen:
                 screen.geometryChanged.connect(lambda _: self._place())
@@ -2384,20 +2843,47 @@ class DynamicCapsule(QWidget):
         self.content.setMouseTracking(True)
         self.compact.setMouseTracking(True)
         self.panel.setMouseTracking(True)
-        collapse_ms = int(self.settings.get("collapse_delay", 180))
+        collapse_ms = int(self.settings.get("collapse_delay", 1000))
         self.leave_timer = QTimer(self, singleShot=True, interval=collapse_ms, timeout=self.collapse)
 
         # Background Audio Worker thread (zero main thread blocking!)
         self.audio_worker = AudioWorker(self)
         self.audio_worker.audio_updated.connect(self._on_audio_worker_update)
+        Volume.worker = self.audio_worker
         self.audio_worker.start()
 
         self._t = time.perf_counter()
-        self.frame = QTimer(self, timerType=Qt.TimerType.PreciseTimer, interval=8, timeout=self._frame)
+        self.frame = QTimer(self, timerType=Qt.TimerType.PreciseTimer, interval=self.FRAME_FAST, timeout=self._frame)
         self.frame.start()
         QTimer(self, interval=1000, timeout=self._tick_1s).start()
-        QTimer(self, interval=1200, timeout=self._tick_hw).start()
-        QTimer(self, interval=600, timeout=self._tick_clip).start()
+        QTimer(self, interval=1000, timeout=self._tick_hw).start()
+
+        # Public address: looked up on a route change (settled for 2 s, a VPN connecting
+        # fires a burst of changes) and every 5 minutes as a backstop
+        self.wan_ready.connect(self._on_wan)
+        self.wan_debounce = QTimer(self, singleShot=True, interval=2000, timeout=self._refresh_wan)
+        QTimer(self, interval=300000, timeout=self._refresh_wan).start()
+
+        # menu.json hot reload
+        self.menu_timer = QTimer(self, singleShot=True, interval=300, timeout=lambda: self.reload_menu(True))
+        self.menu_watch = QFileSystemWatcher(self)
+        self.menu_watch.fileChanged.connect(lambda _: self.menu_timer.start())
+        self.reload_menu()
+
+        self.spectrum = SpectrumWorker()
+        self.media.wave.spectrum = self.compact.spectrum = self.spectrum
+        self.spectrum.start()
+
+        self.media_worker = MediaInfoWorker(self)
+        self.media_worker.info.connect(self._on_media_info)
+        self.media_worker.start()
+        # Read the clipboard only when Windows says it changed (and once it has settled).
+        # Polling it forces the source app to render its data again on every poll,
+        # which stalls both apps when the copy is large (e.g. a big Excel range).
+        self.clip_timer = QTimer(self, singleShot=True, interval=250, timeout=self._read_clip)
+        cb = QApplication.clipboard()
+        if cb:
+            cb.dataChanged.connect(self.clip_timer.start)
         self._tick_1s(); self._tick_hw()
         self._tray()
 
@@ -2431,18 +2917,18 @@ class DynamicCapsule(QWidget):
         dcol.addWidget(self.h_time); dcol.addWidget(self.h_date)
         header.addLayout(dcol)
         header.addStretch()
-        self.tabs = SegmentedTabs(["Media", "System", "Tools", "Focus", "AI"])
+        self.tabs = SegmentedTabs(["Media", "System", "Tools", "Focus", "Apps"])
         self.tabs.setFixedWidth(360)
         header.addWidget(self.tabs, 0, Qt.AlignmentFlag.AlignVCenter)
         pl.addLayout(header)
 
         self.stack = QStackedWidget()
         self.media = MediaPage(self)
-        self.system = SystemPage()
+        self.system = SystemPage(self)
         self.tools = ToolsPage(self)
         self.focus = FocusPage(self)
-        self.ai = AIPage(self)
-        for pg in (self.media, self.system, self.tools, self.focus, self.ai):
+        self.apps = AppsPage(self)
+        for pg in (self.media, self.system, self.tools, self.focus, self.apps):
             self.stack.addWidget(pg)
         self.tabs.changed.connect(self.stack.setCurrentIndex)
         pl.addWidget(self.stack, 1)
@@ -2458,11 +2944,51 @@ class DynamicCapsule(QWidget):
         except Exception:
             self.move(200, self.TOP)
 
+    # ---------- window layer ----------
+    def _apply_layer(self):
+        """Desktop level = bottom of the window stack, like a widget on the wallpaper."""
+        if self._desktop_level:
+            try:
+                ctypes.windll.user32.SetWindowPos(
+                    wintypes.HWND(int(self.winId())), wintypes.HWND(1),  # 1 = HWND_BOTTOM
+                    0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)                # NOSIZE | NOMOVE | NOACTIVATE
+            except Exception:
+                pass
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._apply_layer()
+
+    def nativeEvent(self, event_type, message):
+        # Clicking the capsule would normally raise it above everything. At desktop
+        # level every z-order change is redirected to "stay at the bottom" instead.
+        if self._desktop_level:
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0046:  # WM_WINDOWPOSCHANGING
+                    pos = WINDOWPOS.from_address(msg.lParam)
+                    pos.hwndInsertAfter = 1   # HWND_BOTTOM
+                    pos.flags &= ~0x0004      # clear SWP_NOZORDER so the line above applies
+            except Exception:
+                pass
+        return False, 0
+
+    def _on_primary_screen(self, screen):
+        if screen:
+            screen.geometryChanged.connect(lambda _: self._place())
+        self._place()
 
     # ---------- geometry ----------
     def pill_rect(self):
         w, h = self.sw.x, self.sh.x
         return QRectF((self.WIN_W - w) / 2, self.TOP, w, h)
+
+    # Frame pacing: full speed only while something is really moving. An always-on
+    # 125 fps repaint of a translucent window is what pinned a CPU core on laptops.
+    FRAME_FAST = 8       # springs / aura in motion
+    FRAME_SPECTRUM = 16  # live spectrum on the Media page
+    FRAME_AMBIENT = 33   # mini equalizer, gauges, album art
+    FRAME_IDLE = 150     # nothing to draw; just watch for toasts ending
 
     def _frame(self):
         now = time.perf_counter()
@@ -2473,42 +2999,57 @@ class DynamicCapsule(QWidget):
         if self.toast_until and now > self.toast_until:
             self.toast_until = 0
             self.compact.toast_text = ""
+            self.compact.update()
             self._update_compact_target()
 
-        if self.aura > 0:
+        fading = self.aura > 0
+        if fading:
             self.aura = max(0.0, self.aura - dt * 1.4)
 
+        # Re-lay-out, re-mask and repaint only when the pill actually changed
         r = self.pill_rect()
-        rect = r.toRect()
-        self.content.setGeometry(rect)
-        self.compact.setGeometry(0, 0, rect.width(), self.COMPACT_H)
-        self.panel.move(int((rect.width() - self.EXP_W) / 2), 0)
+        key = (r.x(), r.width(), r.height(), self.TOP, self.EXP_H)
+        if key != self._layout_key:
+            self._layout_key = key
+            moving = True
+            rect = r.toRect()
+            self.content.setGeometry(rect)
+            self.compact.setGeometry(0, 0, rect.width(), self.COMPACT_H)
+            self.panel.move(int((rect.width() - self.EXP_W) / 2), 0)
 
-        denom = max(1.0, float(self.EXP_H - self.COMPACT_H))
-        prog = max(0.0, min(1.0, (self.sh.x - self.COMPACT_H) / denom))
-        self.compact_fx.setOpacity(max(0.0, 1 - prog * 3))
-        self.panel_fx.setOpacity(max(0.0, (prog - 0.35) / 0.65))
-        self.compact.setVisible(prog < 0.34)
-        self.panel.setVisible(prog > 0.3)
-
-        # Only update geometry, mask, and repaint when moving or aura changes
-        if moving or (self.aura > 0) or (prog > 0.01 and prog < 0.99):
-            try:
-                path = QPainterPath()
-                rad = max(4.0, min(r.height() / 2, 32.0))
-                path.addRoundedRect(r.adjusted(-1.5, -1.5, 1.5, 1.5), rad, rad)
-                self.setMask(QRegion(path.toFillPolygon().toPolygon()))
-            except Exception:
-                pass
+            denom = max(1.0, float(self.EXP_H - self.COMPACT_H))
+            prog = max(0.0, min(1.0, (self.sh.x - self.COMPACT_H) / denom))
+            self.compact_fx.setOpacity(max(0.0, 1 - prog * 3))
+            self.panel_fx.setOpacity(max(0.0, (prog - 0.35) / 0.65))
+            # A fully opaque effect still renders through an off-screen copy; switch it off
+            self.compact_fx.setEnabled(prog > 0.001)
+            self.panel_fx.setEnabled(prog < 0.999)
+            self.compact.setVisible(prog < 0.34)
+            self.panel.setVisible(prog > 0.3)
+            # No window mask: the transparent canvas is click-through on its own, and
+            # re-cutting the window region on every frame made the morph stutter.
+            self.update()
+        elif fading:
             self.update()
 
+        spectrum = False
+        ambient = self.compact.isVisible() and self.compact.tick(dt)
+        moving |= self.tabs.tick(dt)
+        if self.panel.isVisible():
+            page = self.stack.currentWidget()
+            if page is self.media:
+                ambient |= self.media.tick(dt)
+                if self.media.wave.active:
+                    spectrum = True
+            elif page is self.system:
+                ambient |= self.system.tick(dt)
+            elif page is self.focus:
+                moving |= self.focus.ring.tick(dt)
 
-        self.compact.tick(dt)
-        self.tabs.tick(dt)
-        if self.expanded:
-            self.media.tick(dt)
-            self.system.tick(dt)
-            self.focus.ring.tick(dt)
+        rate = (self.FRAME_FAST if (moving or fading) else self.FRAME_SPECTRUM if spectrum
+                else self.FRAME_AMBIENT if ambient else self.FRAME_IDLE)
+        if self.frame.interval() != rate:
+            self.frame.setInterval(rate)
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -2554,14 +3095,14 @@ class DynamicCapsule(QWidget):
             return
         self.expanded = True
         self.sw.target, self.sh.target = self.EXP_W, self.EXP_H
+        self._tick_hw()
         self._frame()
 
     def collapse(self):
         if not self.expanded or self.pinned:
             return
         self.expanded = False
-        if hasattr(self, "ai") and self.ai is not None:
-            self.ai.cancel_request()
+        self._manual_open = False
         self._update_compact_target()
         self._frame()
 
@@ -2569,17 +3110,27 @@ class DynamicCapsule(QWidget):
         self.compact.toast_text, self.compact.toast_icon, self.compact.toast_color = text, icon, color
         self.toast_until = time.perf_counter() + secs
         self.aura, self.aura_color = 1.0, color
+        self.compact.update()
         self._update_compact_target()
+        self._frame()
+
+    def _hold_open(self):
+        """Stay expanded while one of our menus is open."""
+        return QApplication.activePopupWidget() is not None
+
+    def _schedule_collapse(self):
+        if self.expanded and not self.pinned and not self.leave_timer.isActive() and not self._hold_open():
+            self.leave_timer.start()
 
     def enterEvent(self, e):
         self.leave_timer.stop()
+        self._manual_open = False
         if not self.expanded:
             self.expand()
         super().enterEvent(e)
 
     def leaveEvent(self, e):
-        if self.expanded and not self.pinned:
-            self.leave_timer.start()
+        self._schedule_collapse()
         super().leaveEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -2589,8 +3140,7 @@ class DynamicCapsule(QWidget):
             if not self.expanded:
                 self.expand()
         else:
-            if self.expanded and not self.pinned and not self.leave_timer.isActive():
-                self.leave_timer.start()
+            self._schedule_collapse()
         super().mouseMoveEvent(e)
 
     def mousePressEvent(self, e):
@@ -2607,12 +3157,20 @@ class DynamicCapsule(QWidget):
 
     def wheelEvent(self, e):
         if self.expanded:
-            n = 4
+            n = len(self.tabs.labels)
             self.tabs.set_index((self.tabs.index + (-1 if e.angleDelta().y() > 0 else 1)) % n)
 
     # ---------- actions ----------
+    def media_cmd(self, name):
+        """toggle / next / prev: sent to the playing app's media session when there is
+        one, otherwise as a keyboard media key."""
+        if self.media_info and self.media_worker.available:
+            self.media_worker.command(name)
+        else:
+            media_key({"toggle": VK_PLAY, "next": VK_NEXT, "prev": VK_PREV}[name])
+
     def toggle_play(self):
-        media_key(VK_PLAY)
+        self.media_cmd("toggle")
         self.aura, self.aura_color = 0.8, M3.PRIMARY
 
     def toggle_mute(self):
@@ -2659,7 +3217,8 @@ class DynamicCapsule(QWidget):
         btns = self.settings.get("tools_buttons", DEFAULT_BUTTONS)
         if not isinstance(btns, list):
             btns = list(DEFAULT_BUTTONS)
-        return btns
+        # Settings saved by older versions may still list the removed AI Assistant tile
+        return [b for b in btns if isinstance(b, dict) and b.get("action") != "ai"]
 
     def set_buttons(self, btns):
         self.settings.set("tools_buttons", btns)
@@ -2694,10 +3253,7 @@ class DynamicCapsule(QWidget):
 
     def execute_button_action(self, b: dict):
         act = b.get("action", "")
-        if act == "ai":
-            self.expand()
-            self.tabs.set_index(4)
-        elif act == "snip":
+        if act == "snip":
             self.snip()
         elif act == "mute":
             self.toggle_mute()
@@ -2712,7 +3268,7 @@ class DynamicCapsule(QWidget):
         elif act == "notepad":
             subprocess.Popen("notepad.exe", shell=True)
         elif act == "term":
-            subprocess.Popen("wt.exe" if os.system("where wt >nul 2>&1") == 0 else "cmd.exe", shell=True)
+            subprocess.Popen("wt.exe" if shutil.which("wt") else "cmd.exe", shell=True)
         elif act == "explorer":
             subprocess.Popen("explorer.exe", shell=True)
         elif act == "browser":
@@ -2772,6 +3328,8 @@ class DynamicCapsule(QWidget):
         self.focus.ring.running = secs > 0
         self.focus.ring.progress.target = 1.0
         self.focus.ring.text = self._fmt(secs) if secs else "25:00"
+        self.focus.ring.update()
+        self.compact.update()
         if secs:
             self.toast(f"Focus · {secs // 60} min", "timer", M3.TERTIARY)
         self._update_compact_target()
@@ -2781,38 +3339,87 @@ class DynamicCapsule(QWidget):
         return f"{s // 60:02d}:{s % 60:02d}"
 
     # ---------- monitors ----------
+    def get_monitors(self):
+        """Enabled System-page monitors, in display order."""
+        chosen = self.settings.get("monitors")
+        if not isinstance(chosen, list):
+            chosen = default_monitors()
+        return [m for m in MONITOR_ORDER if m in chosen]
+
+    def set_monitor(self, mid, on):
+        chosen = set(self.get_monitors())
+        if on:
+            chosen.add(mid)
+        else:
+            chosen.discard(mid)
+        self.settings.set("monitors", [m for m in MONITOR_ORDER if m in chosen])
+        self._monitors_changed()
+
+    def _monitors_changed(self):
+        self.system.rebuild()
+        if self.system.strip.show_ips and not self.wan_ip:
+            self.net.probe()
+            self._refresh_wan()
+        self._tick_1s()
+        self._tick_hw()
+        if self.settings_dialog is not None:
+            self.settings_dialog.sync_monitors()
+
+    def _on_media_info(self, info):
+        self.media_info = info
+        self._refresh_media()
+
+    def _refresh_media(self):
+        """Media page text: the real track when Windows knows it, else the app making sound."""
+        m = self.media_info
+        playing = self.audio_playing
+        if m:
+            title = m["title"]
+            sub = "  ·  ".join(x for x in (m["artist"], m["app"]) if x)
+            playing = m["playing"]
+        elif playing:
+            title, sub = self.audio_app or "Now playing", "Playing on this PC"
+        else:
+            title, sub = "Nothing playing", "Play something to see it here"
+        self.media.title.setText(title)
+        self.media.sub.setText(sub)
+        self.media.art.set_art(m["art"] if m else b"")
+        self.media.btn_play.set_icon("pause" if playing else "play")
+
     def _on_audio_worker_update(self, playing, peak, app_name, vol_val, is_muted):
         was = self.audio_playing
         self.audio_playing = playing
         self.audio_peak = peak
         self.audio_app = app_name
+        Volume._cached_mute = is_muted
 
+        # Loudness relative to the recent peak, so the bars also move at low volume
+        self._peak_ref = max(self._peak_ref * 0.995, peak, 0.02)
+        energy = min(1.0, peak / self._peak_ref)
         self.compact.playing = playing
-        self.compact.energy = peak
+        self.compact.energy = energy
         self.media.wave.active = playing
-        self.media.wave.energy = peak
+        self.spectrum.active = playing
+        self.media.wave.energy = energy
         self.media.art.playing = playing
-        self.media.btn_play.set_icon("pause" if playing else "play")
         self.media.vol_icon.set_icon("mute" if is_muted else "speaker")
-        if self.tools.t_mute:
+        if self.tools.t_mute and self.tools.t_mute.active != is_muted:
             self.tools.t_mute.active = is_muted
             self.tools.t_mute.update()
 
-        if playing:
-            self.media.title.setText(app_name or "Now playing")
-            self.media.sub.setText("Playing on this PC")
-        else:
-            self.media.title.setText("Nothing playing")
-            self.media.sub.setText("Play something to see it here")
+        self._refresh_media()
 
         if not self.media.slider.isSliderDown() and vol_val != self.media.slider.value():
+            Volume._cached_vol = vol_val
             self.media.slider.blockSignals(True)
             self.media.slider.setValue(vol_val)
             self.media.slider.blockSignals(False)
             self.media.vol_lbl.setText(f"{vol_val}%")
 
         if was != playing:
+            self.compact.update()
             self._update_compact_target()
+            self._frame()
 
     def _tick_1s(self):
         now = QTime.currentTime()
@@ -2820,6 +3427,7 @@ class DynamicCapsule(QWidget):
         from PyQt6.QtCore import QDate
         self.h_date.setText(QDate.currentDate().toString("dddd, d MMMM"))
 
+        shown = (self.compact.time_text, self.compact.battery, self.compact.charging)
         if self.focus_left > 0:
             if not self.focus_paused:
                 self.focus_left -= 1
@@ -2831,6 +3439,7 @@ class DynamicCapsule(QWidget):
                     for _, c in self.focus.chips:
                         c.selected = False; c.update()
                     self.toast("Focus session complete", "timer", M3.TERTIARY, 4)
+                self.focus.ring.update()
             self.compact.time_text = self._fmt(self.focus_left)
         else:
             if self.clock_frozen_time is not None:
@@ -2846,44 +3455,124 @@ class DynamicCapsule(QWidget):
                 b = None
         if b:
             self.compact.battery, self.compact.charging = int(b.percent), bool(b.power_plugged)
-            self.system.bat.set_value(b.percent, "Charging" if b.power_plugged else "On battery")
+            self.system.set("battery", b.percent, "Charging" if b.power_plugged else "On battery")
         else:
             self.compact.battery = None
-            self.system.bat.set_value(100, "AC power")
+            self.system.set("battery", 100, "AC power")
+        if shown != (self.compact.time_text, self.compact.battery, self.compact.charging):
+            self.compact.update()
+
+        # Safety net: a missed leave event must not leave the capsule stuck open
+        if self.expanded and not self._manual_open:
+            if not self.pill_rect().contains(QPointF(self.mapFromGlobal(QCursor.pos()))):
+                self._schedule_collapse()
 
     def _tick_hw(self):
+        if not (HAS_PSUTIL and psutil):
+            return
         try:
-            if HAS_PSUTIL and psutil:
-                self.system.cpu.set_value(psutil.cpu_percent(None), f"{psutil.cpu_count() or 4} threads")
+            now = time.monotonic()
+            if now - self._cpu_at >= 0.5:  # shorter windows give meaningless percentages
+                self._cpu_at = now
+                self._cpu_pct = psutil.cpu_percent(None)
+                self.net.sample()
+                self._probe_n += 1
+                if self._probe_n % 3 == 1 and self.system.strip.show_ips and self.net.probe():
+                    self.wan_ip = ""
+                    self.wan_debounce.start()
+            if not self.expanded:
+                return  # nobody is looking at the gauges
+            if self.system.strip.isVisibleTo(self.system):
+                self.system.strip.update()
+
+            shown = self.system.gauges
+            if "cpu" in shown:
+                self.system.set("cpu", self._cpu_pct, f"{self._threads} threads")
+            if "ram" in shown:
                 vm = psutil.virtual_memory()
-                self.system.ram.set_value(vm.percent, f"{vm.used / 2**30:.1f} / {vm.total / 2**30:.0f} GB")
-            else:
-                self.system.cpu.set_value(0, "System ready")
-                self.system.ram.set_value(0, "System ready")
-            g = gpu_stats()
-            if g:
-                util, mem, temp = g
-                self.system.gpu.set_value(util, f"VRAM {mem}%" + (f" · {temp}°C" if temp else ""))
-            else:
-                self.system.gpu.set_value(0, "Not available")
+                self.system.set("ram", vm.percent, f"{vm.used / 2**30:.1f} / {vm.total / 2**30:.0f} GB")
+            if "gpu" in shown:
+                g = gpu_stats()
+                if g:
+                    util, mem, temp = g
+                    self.system.set("gpu", util, f"VRAM {mem}%" + (f" · {temp}°C" if temp else ""))
+                else:
+                    self.system.set("gpu", 0, "Not available")
+            if "disk" in shown:
+                du = psutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\")
+                self.system.set("disk", du.percent, f"{du.free / 2**30:.0f} GB free")
+            for mid, rate in (("net_down", self.net.down), ("net_up", self.net.up)):
+                if mid in shown:
+                    num, unit = fmt_rate(rate)
+                    self.system.set(mid, rate / self.net.scale * 100, unit, num)
         except Exception:
             pass
 
-    def _tick_clip(self):
+    def _refresh_wan(self):
+        if self._wan_busy or "ips" not in self.get_monitors():
+            return
+        self._wan_busy = True
+
+        def work():
+            ip = fetch_wan_ip()
+            try:
+                self.wan_ready.emit(ip)
+            except RuntimeError:
+                pass  # the app quit while the lookup was in flight
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_wan(self, ip):
+        self._wan_busy = False
+        self.wan_ip = ip
+        self.system.strip.update()
+
+    # ---------- app launcher ----------
+    def reload_menu(self, announce=False):
+        try:
+            self.menu_groups = load_menu()
+        except Exception as err:
+            # Keep the previous menu; a half-saved or mistyped file must not empty it
+            self.toast(f"menu.json: {err}"[:80], "close", M3.ERROR, 6)
+        else:
+            self.apps.rebuild()
+            if announce:
+                self.toast("Menu reloaded", "reload", M3.PRIMARY)
+        # Editors that save by replacing the file drop it from the watch list
+        if os.path.exists(MENU_FILE) and MENU_FILE not in self.menu_watch.files():
+            self.menu_watch.addPath(MENU_FILE)
+
+    def edit_menu(self):
+        # Always Notepad, in its own window. The default .json handler is often an
+        # editor that is already running (VS Code), which opens the file as a
+        # background tab without coming forward - it looks like nothing happened.
+        try:
+            subprocess.Popen(["notepad.exe", MENU_FILE])
+            self.toast("menu.json opened in Notepad  ·  save to apply", "note", M3.PRIMARY, 3)
+        except OSError:
+            os.startfile(MENU_FILE)
+
+    def launch_item(self, item):
+        try:
+            launch_command(item["path"], item["admin"])
+            self.toast(f"Opening {item['name']}", "bolt", M3.PRIMARY, 1.8)
+        except Exception as err:
+            self.toast(f"{item['name']}: {err}"[:80], "close", M3.ERROR, 5)
+
+    def _read_clip(self):
         if not self.settings.get("clipboard_toast", True):
             return
         cb = QApplication.clipboard()
-        if not cb:
-            return
         try:
-            t = cb.text()
+            md = cb.mimeData() if cb else None
+            if md is None or not md.hasText():
+                return
+            t = cb.text()[:2000]
             if t and t != self.last_clip:
                 self.last_clip = t
                 self.tools.set_clip(t)
                 self.toast("Copied · " + t.strip().replace("\n", " ")[:60], "copy", M3.PRIMARY)
         except Exception:
             pass
-
 
     # ---------- settings ----------
     def open_settings(self):
@@ -2917,6 +3606,7 @@ class DynamicCapsule(QWidget):
             else:
                 flags &= ~Qt.WindowType.WindowStaysOnTopHint
             self.setWindowFlags(flags)
+            self._desktop_level = not val
             self.show()
         elif key == "accent_color":
             col = QColor(val)
@@ -2924,8 +3614,13 @@ class DynamicCapsule(QWidget):
             self.aura_color = col
             self.compact.toast_color = col
             self.update()
+            for g in self.system.gauges.values():
+                g.update()
         elif key == "start_on_boot":
             set_windows_autostart(bool(val))
+        elif key == "wan_vpn_color":
+            self.system.strip.update()
+        self._frame()  # wake the frame loop so the change shows immediately
 
     def reset_settings(self):
         self.settings.reset()
@@ -2937,6 +3632,9 @@ class DynamicCapsule(QWidget):
         self.apply_setting("accent_color", self.settings.get("accent_color"))
         self.apply_setting("clipboard_toast", self.settings.get("clipboard_toast"))
         self.apply_setting("start_on_boot", self.settings.get("start_on_boot"))
+        self.apply_setting("wan_vpn_color", self.settings.get("wan_vpn_color"))
+        self.tools.rebuild_buttons()
+        self._monitors_changed()
 
     # ---------- menus ----------
     def _menu_style(self, m):
@@ -2945,8 +3643,16 @@ class DynamicCapsule(QWidget):
                      border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 6px; }}
             QMenu::item {{ padding: 8px 20px; border-radius: 8px; font-family: '{FONT}'; font-size: 12px; }}
             QMenu::item:selected {{ background: {M3.SURFACE_3.name()}; }}
+            QMenu::item:disabled {{ color: {M3.MUTED.name()}; }}
             QMenu::separator {{ height: 1px; background: rgba(255,255,255,0.08); margin: 4px 8px; }}
         """)
+
+    def _expand_manual(self, page=None):
+        """Expand from a menu: stays open until the mouse has visited the capsule."""
+        self.expand()
+        self._manual_open = True
+        if page is not None:
+            self.tabs.set_index(page)
 
     def _menu(self, pos):
         m = QMenu(self)
@@ -2955,10 +3661,38 @@ class DynamicCapsule(QWidget):
         m.addSeparator()
         a_pin = m.addAction("📌  Unpin" if self.pinned else "📌  Keep expanded")
         m.addSeparator()
-        pages = [m.addAction(f"📄  {n}") for n in ("Media", "System", "Tools", "Focus", "AI")]
+        pages = [m.addAction(f"📄  {n}") for n in self.tabs.labels]
+        m.addSeparator()
+        apps = m.addMenu("🚀  Apps")
+        self._menu_style(apps)
+        app_acts = {}
+        for g in self.menu_groups:
+            sub = apps.addMenu(g["name"])
+            self._menu_style(sub)
+            for item in g["items"]:
+                app_acts[sub.addAction(item["name"])] = item
+        if self.menu_groups:
+            apps.addSeparator()
+        a_edit = apps.addAction("✏️  Edit menu file")
+        a_reload = apps.addAction("🔄  Reload menu file")
+        mon = m.addMenu("📊  Monitors")
+        self._menu_style(mon)
+        enabled = self.get_monitors()
+        mon_acts = {}
+        for mid in MONITOR_ORDER:
+            title = MONITORS[mid][0]
+            if mid in enabled:
+                act = mon.addAction(f"✓  {title}")
+            elif monitor_available(mid):
+                act = mon.addAction(f"     {title}")
+            else:
+                act = mon.addAction(f"     {title}  (not on this PC)")
+                act.setEnabled(False)
+            mon_acts[act] = mid
         m.addSeparator()
         a_quit = m.addAction("🚪  Quit")
         a = m.exec(pos)
+        m.deleteLater()
         if a == a_sett:
             self.open_settings()
         elif a == a_pin:
@@ -2966,10 +3700,19 @@ class DynamicCapsule(QWidget):
             if self.pinned:
                 self.expand()
         elif a in pages:
-            self.expand()
-            self.tabs.set_index(pages.index(a))
+            self._expand_manual(pages.index(a))
+        elif a in app_acts:
+            self.launch_item(app_acts[a])
+        elif a == a_edit:
+            self.edit_menu()
+        elif a == a_reload:
+            self.reload_menu(True)
+        elif a in mon_acts:
+            mid = mon_acts[a]
+            self.set_monitor(mid, mid not in enabled)
+            self._expand_manual(self.tabs.labels.index("System"))
         elif a == a_quit:
-            QApplication.quit()
+            self.quit_app()
 
     def _tray(self):
         try:
@@ -2988,39 +3731,67 @@ class DynamicCapsule(QWidget):
             self._menu_style(m)
             m.addAction("⚙️  Settings...", self.open_settings)
             m.addSeparator()
-            m.addAction("Expand", self.expand)
+            m.addAction("Expand", lambda: self._expand_manual())
             m.addAction("Collapse", self.collapse)
             m.addSeparator()
-            m.addAction("Quit", self.close)
+            m.addAction("Quit", self.quit_app)
+            self._tray_menu = m
             self.tray.setContextMenu(m)
             self.tray.show()
         except Exception:
             pass
 
-    def closeEvent(self, e):
-        if hasattr(self, "ai") and self.ai is not None:
-            self.ai.cancel_request()
-        if hasattr(self, "audio_worker") and self.audio_worker is not None:
-            self.audio_worker.stop()
-        if hasattr(self, "settings_dialog") and self.settings_dialog is not None:
+    def quit_app(self):
+        """The one way out: stop every thread first, then leave the event loop.
+        (Qt aborts the process if a QThread is still running when it is destroyed.)"""
+        if self._quitting:
+            return
+        self._quitting = True
+        self.frame.stop()
+        Volume.worker = None
+        self.audio_worker.stop()
+        self.media_worker.stop()
+        self.spectrum.stop()
+        if self.settings_dialog is not None:
             self.settings_dialog.close()
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, e):
+        self.quit_app()
         super().closeEvent(e)
 
 
+_fault_log = None
+
+
 def setup_crash_handler():
+    global _fault_log
+    log_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DynamicIsland")
+    log_file = os.path.join(log_dir, "crash.log")
+    try:
+        # Native crashes (access violations in Qt / COM) never reach sys.excepthook;
+        # faulthandler writes their Python stack to the same log instead.
+        os.makedirs(log_dir, exist_ok=True)
+        _fault_log = open(log_file, "a", encoding="utf-8")
+        faulthandler.enable(file=_fault_log)
+    except Exception:
+        pass
+
     def _hook(exctype, value, tb):
         import traceback
-        log_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DynamicIsland")
         try:
             os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(log_dir, "crash.log")
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n==================== CRASH AT {time.strftime('%Y-%m-%d %H:%M:%S')} ====================\n")
                 f.write(f"OS: {sys.platform} | Python: {sys.version}\n")
                 traceback.print_exception(exctype, value, tb, file=f)
         except Exception:
             pass
-        traceback.print_exception(exctype, value, tb)
+        if sys.stderr is not None:  # None under pythonw.exe
+            traceback.print_exception(exctype, value, tb)
     sys.excepthook = _hook
 
 
@@ -3050,8 +3821,23 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setFont(font(12))
 
-    w = DynamicCapsule()
-    w.show()
+    try:
+        w = DynamicCapsule()
+        w.show()
+    except Exception as err:
+        # Started without a console (pythonw), a startup failure would otherwise be invisible
+        sys.excepthook(type(err), err, err.__traceback__)
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"Dynamic Island could not start.\n\n{type(err).__name__}: {err}\n\n"
+                "Details were saved to %APPDATA%\\DynamicIsland\\crash.log",
+                "Dynamic Island",
+                0x10
+            )
+        except Exception:
+            pass
+        sys.exit(1)
     sys.exit(app.exec())
 
 
