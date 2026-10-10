@@ -1608,10 +1608,18 @@ class DynamicCapsule(QWidget):
         self.focus_paused = False
         self.clock_frozen_time = None
         self.toast_until = 0.0
-        self.last_clip = QApplication.clipboard().text()
+        cb = QApplication.clipboard()
+        self.last_clip = cb.text() if cb else ""
 
         self._build()
         self._place()
+        try:
+            screen = QApplication.primaryScreen()
+            if screen:
+                screen.geometryChanged.connect(lambda _: self._place())
+        except Exception:
+            pass
+
 
         self.setMouseTracking(True)
         self.content.setMouseTracking(True)
@@ -1685,10 +1693,6 @@ class DynamicCapsule(QWidget):
             if screen:
                 scr = screen.geometry()
                 self.move(scr.x() + (scr.width() - self.WIN_W) // 2, scr.y() + self.TOP)
-                try:
-                    screen.geometryChanged.connect(lambda _: self._place())
-                except Exception:
-                    pass
             else:
                 self.move((1920 - self.WIN_W) // 2, self.TOP)
         except Exception:
@@ -1720,7 +1724,8 @@ class DynamicCapsule(QWidget):
         self.compact.setGeometry(0, 0, rect.width(), self.COMPACT_H)
         self.panel.move(int((rect.width() - self.EXP_W) / 2), 0)
 
-        prog = max(0.0, min(1.0, (self.sh.x - self.COMPACT_H) / (self.EXP_H - self.COMPACT_H)))
+        denom = max(1.0, float(self.EXP_H - self.COMPACT_H))
+        prog = max(0.0, min(1.0, (self.sh.x - self.COMPACT_H) / denom))
         self.compact_fx.setOpacity(max(0.0, 1 - prog * 3))
         self.panel_fx.setOpacity(max(0.0, (prog - 0.35) / 0.65))
         self.compact.setVisible(prog < 0.34)
@@ -1728,11 +1733,15 @@ class DynamicCapsule(QWidget):
 
         # Only update geometry, mask, and repaint when moving or aura changes
         if moving or (self.aura > 0) or (prog > 0.01 and prog < 0.99):
-            path = QPainterPath()
-            rad = min(r.height() / 2, 32)
-            path.addRoundedRect(r.adjusted(-1.5, -1.5, 1.5, 1.5), rad, rad)
-            self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+            try:
+                path = QPainterPath()
+                rad = max(4.0, min(r.height() / 2, 32.0))
+                path.addRoundedRect(r.adjusted(-1.5, -1.5, 1.5, 1.5), rad, rad)
+                self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+            except Exception:
+                pass
             self.update()
+
 
         self.compact.tick(dt)
         self.tabs.tick(dt)
@@ -1991,11 +2000,18 @@ class DynamicCapsule(QWidget):
     def _tick_clip(self):
         if not self.settings.get("clipboard_toast", True):
             return
-        t = QApplication.clipboard().text()
-        if t and t != self.last_clip:
-            self.last_clip = t
-            self.tools.set_clip(t)
-            self.toast("Copied · " + t.strip().replace("\n", " ")[:60], "copy", M3.PRIMARY)
+        cb = QApplication.clipboard()
+        if not cb:
+            return
+        try:
+            t = cb.text()
+            if t and t != self.last_clip:
+                self.last_clip = t
+                self.tools.set_clip(t)
+                self.toast("Copied · " + t.strip().replace("\n", " ")[:60], "copy", M3.PRIMARY)
+        except Exception:
+            pass
+
 
     # ---------- settings ----------
     def open_settings(self):
@@ -2131,32 +2147,7 @@ def setup_crash_handler():
         except Exception:
             pass
         traceback.print_exception(exctype, value, tb)
-        try:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                f"Dynamic Island encountered an error:\n\n{value}\n\nA crash log was saved to:\n%APPDATA%\\DynamicIsland\\crash.log",
-                "Dynamic Island - Error",
-                0x10
-            )
-        except Exception:
-            pass
     sys.excepthook = _hook
-
-
-def ensure_single_instance():
-    try:
-        from PyQt6.QtNetwork import QLocalSocket, QLocalServer
-        socket = QLocalSocket()
-        socket.connectToServer("DynamicIslandWindows_SingleInstance")
-        if socket.waitForConnected(400):
-            socket.close()
-            return None
-        server = QLocalServer()
-        server.removeServer("DynamicIslandWindows_SingleInstance")
-        server.listen("DynamicIslandWindows_SingleInstance")
-        return server
-    except Exception:
-        return None
 
 
 def main():
@@ -2185,25 +2176,11 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setFont(font(12))
 
-    # Single instance guard
-    server = ensure_single_instance()
-    if server is None:
-        # Check if already running by attempting connection
-        try:
-            from PyQt6.QtNetwork import QLocalSocket
-            s = QLocalSocket()
-            s.connectToServer("DynamicIslandWindows_SingleInstance")
-            if s.waitForConnected(300):
-                s.close()
-                sys.exit(0)
-        except Exception:
-            pass
-
     w = DynamicCapsule()
     w.show()
     sys.exit(app.exec())
 
 
-
 if __name__ == "__main__":
     main()
+
