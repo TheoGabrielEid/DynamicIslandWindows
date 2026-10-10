@@ -1,47 +1,54 @@
 {
   "groups": [
     {
-      "name": "Apps",
+      "name": "Productivity",
       "items": [
-        {
-          "name": "Notepad",
-          "path": "notepad.exe"
-        },
-        {
-          "name": "Calculator",
-          "path": "calc.exe"
-        },
-        {
-          "name": "File Explorer",
-          "path": "explorer.exe"
-        }
+        { "name": "Notepad", "path": "notepad.exe" },
+        { "name": "Calculator", "path": "calc.exe" },
+        { "name": "WordPad", "path": "write.exe" },
+        { "name": "Paint", "path": "mspaint.exe" },
+        { "name": "Snipping Tool", "path": "explorer.exe ms-screenclip:" },
+        { "name": "Sticky Notes", "path": "shell:AppsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App" }
       ]
     },
     {
-      "name": "System",
+      "name": "Coding & Dev",
       "items": [
-        {
-          "name": "Settings",
-          "path": "ms-settings:"
-        },
-        {
-          "name": "Task Manager",
-          "path": "taskmgr.exe"
-        },
-        {
-          "name": "Terminal (Admin)",
-          "path": "cmd.exe",
-          "runAsAdmin": true
-        }
+        { "name": "Visual Studio Code", "path": "code" },
+        { "name": "Windows Terminal", "path": "wt.exe" },
+        { "name": "PowerShell", "path": "powershell.exe" },
+        { "name": "Command Prompt", "path": "cmd.exe" },
+        { "name": "PowerShell (Admin)", "path": "powershell.exe", "runAsAdmin": true },
+        { "name": "CMD (Admin)", "path": "cmd.exe", "runAsAdmin": true }
       ]
     },
     {
-      "name": "Web",
+      "name": "AI & Web",
       "items": [
-        {
-          "name": "Google",
-          "path": "https://www.google.com"
-        }
+        { "name": "ChatGPT", "path": "https://chatgpt.com" },
+        { "name": "Claude", "path": "https://claude.ai" },
+        { "name": "Gemini", "path": "https://gemini.google.com" },
+        { "name": "GitHub", "path": "https://github.com" }
+      ]
+    },
+    {
+      "name": "System & Tools",
+      "items": [
+        { "name": "File Explorer", "path": "explorer.exe" },
+        { "name": "Task Manager", "path": "taskmgr.exe" },
+        { "name": "Windows Settings", "path": "ms-settings:" },
+        { "name": "Control Panel", "path": "control.exe" },
+        { "name": "Resource Monitor", "path": "resmon.exe" },
+        { "name": "Device Manager", "path": "devmgmt.msc" }
+      ]
+    },
+    {
+      "name": "Media & Games",
+      "items": [
+        { "name": "Media Player", "path": "wmplayer.exe" },
+        { "name": "Photos", "path": "shell:AppsFolder\\Microsoft.Windows.Photos_8wekyb3d8bbwe!App" },
+        { "name": "Xbox Game Bar", "path": "shell:AppsFolder\\Microsoft.XboxGamingOverlay_8wekyb3d8bbwe!App" },
+        { "name": "Steam", "path": "steam://open/main" }
       ]
     }
   ]
