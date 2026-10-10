@@ -106,7 +106,7 @@ class Volume:
             return
         try:
             dev = cls._dev()
-            if dev and hasattr(dev, "EndpointVolume"):
+            if dev and hasattr(dev, "EndpointVolume") and dev.EndpointVolume:
                 dev.EndpointVolume.SetMasterVolumeLevelScalar(cls._cached_vol / 100.0, None)
         except Exception:
             pass
@@ -118,7 +118,7 @@ class Volume:
             return cls._cached_mute
         try:
             dev = cls._dev()
-            if dev and hasattr(dev, "EndpointVolume"):
+            if dev and hasattr(dev, "EndpointVolume") and dev.EndpointVolume:
                 ev = dev.EndpointVolume
                 m = not ev.GetMute()
                 ev.SetMute(m, None)
@@ -126,6 +126,7 @@ class Volume:
                 return m
         except Exception:
             pass
+        cls._cached_mute = not cls._cached_mute
         return cls._cached_mute
 
 
@@ -139,7 +140,7 @@ class AudioWorker(QThread):
 
     def stop(self):
         self._running = False
-        self.wait(500)
+        self.wait(400)
 
     def run(self):
         try:
@@ -161,9 +162,14 @@ class AudioWorker(QThread):
 
             if PYCAW:
                 try:
-                    dev = AudioUtilities.GetSpeakers()
+                    dev = None
+                    try:
+                        dev = AudioUtilities.GetSpeakers()
+                    except Exception:
+                        dev = None
+
                     if dev:
-                        if hasattr(dev, "EndpointVolume"):
+                        if hasattr(dev, "EndpointVolume") and dev.EndpointVolume:
                             try:
                                 ev = dev.EndpointVolume
                                 vol_val = int(round(ev.GetMasterVolumeLevelScalar() * 100))
@@ -174,33 +180,38 @@ class AudioWorker(QThread):
                                 pass
 
                         # Check master endpoint meter first
-                        try:
-                            meter = cast(dev._dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None),
-                                         POINTER(IAudioMeterInformation))
-                            peak = float(meter.GetPeakValue())
-                        except Exception:
-                            pass
+                        if hasattr(dev, "_dev") and dev._dev:
+                            try:
+                                meter_itf = dev._dev.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None)
+                                meter = cast(meter_itf, POINTER(IAudioMeterInformation))
+                                peak = float(meter.GetPeakValue())
+                            except Exception:
+                                pass
 
                         # If audio is playing or to identify active session
-                        if hasattr(dev, "AudioSessionManager"):
+                        if hasattr(dev, "AudioSessionManager") and dev.AudioSessionManager:
                             try:
                                 mgr = dev.AudioSessionManager
                                 sessions = mgr.GetSessionEnumerator()
-                                for i in range(sessions.GetCount()):
-                                    s = sessions.GetSession(i)
-                                    s_meter = s.QueryInterface(IAudioMeterInformation)
-                                    sp = float(s_meter.GetPeakValue())
-                                    if sp > 0.01:
-                                        if sp > peak:
-                                            peak = sp
-                                        from pycaw.pycaw import IAudioSessionControl2
-                                        ctl2 = s.QueryInterface(IAudioSessionControl2)
-                                        pid = ctl2.GetProcessId()
-                                        if pid:
+                                count = sessions.GetCount() if hasattr(sessions, "GetCount") else 0
+                                for i in range(count):
+                                    try:
+                                        s = sessions.GetSession(i)
+                                        s_meter = s.QueryInterface(IAudioMeterInformation)
+                                        sp = float(s_meter.GetPeakValue())
+                                        if sp > 0.01:
+                                            if sp > peak:
+                                                peak = sp
                                             try:
-                                                cur_app = psutil.Process(pid).name().replace(".exe", "").capitalize()
+                                                from pycaw.pycaw import IAudioSessionControl2
+                                                ctl2 = s.QueryInterface(IAudioSessionControl2)
+                                                pid = ctl2.GetProcessId()
+                                                if pid:
+                                                    cur_app = psutil.Process(pid).name().replace(".exe", "").capitalize()
                                             except Exception:
-                                                cur_app = "System"
+                                                pass
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                 except Exception:
@@ -220,7 +231,10 @@ class AudioWorker(QThread):
                     playing = False
                     app_name = ""
 
-            self.audio_updated.emit(playing, peak, app_name, vol_val, is_muted)
+            try:
+                self.audio_updated.emit(playing, peak, app_name, vol_val, is_muted)
+            except Exception:
+                pass
             time.sleep(0.08)
 
         if pythoncom:
@@ -1082,8 +1096,12 @@ class DynamicCapsule(QWidget):
         pl.addWidget(self.stack, 1)
 
     def _place(self):
-        scr = QApplication.primaryScreen().geometry()
-        self.move(scr.x() + (scr.width() - self.WIN_W) // 2, scr.y())
+        screen = QApplication.primaryScreen()
+        if screen:
+            scr = screen.geometry()
+            self.move(scr.x() + (scr.width() - self.WIN_W) // 2, scr.y())
+        else:
+            self.move((1920 - self.WIN_W) // 2, 0)
 
     # ---------- geometry ----------
     def pill_rect(self):
