@@ -5,7 +5,7 @@
       "items": [
         { "name": "Notepad", "path": "notepad.exe" },
         { "name": "Calculator", "path": "calc.exe" },
-        { "name": "WordPad", "path": "write.exe" },
+        { "name": "Browser", "path": "msedge.exe" },
         { "name": "Paint", "path": "mspaint.exe" },
         { "name": "Snipping Tool", "path": "explorer.exe ms-screenclip:" },
         { "name": "Sticky Notes", "path": "shell:AppsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App" }
