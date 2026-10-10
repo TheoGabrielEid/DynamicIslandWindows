@@ -585,9 +585,9 @@ def fetch_wan_ip(timeout=6):
 
 
 # ───────────────────────── App launcher (menu.json) ─────────────────────────
-_LOCAL_MENU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "menu.json")
 _APPDATA_MENU = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DynamicIsland", "menu.json")
-MENU_FILE = _LOCAL_MENU if os.path.exists(_LOCAL_MENU) else _APPDATA_MENU
+_LOCAL_MENU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "menu.json")
+MENU_FILE = _APPDATA_MENU if os.path.exists(_APPDATA_MENU) else (_LOCAL_MENU if os.path.exists(_LOCAL_MENU) else _APPDATA_MENU)
 
 # Written the first time the app runs; edit it from right-click → Apps → Edit menu file
 DEFAULT_MENU = {
