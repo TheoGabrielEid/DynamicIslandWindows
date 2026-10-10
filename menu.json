@@ -1,0 +1,48 @@
+{
+  "groups": [
+    {
+      "name": "Apps",
+      "items": [
+        {
+          "name": "Notepad",
+          "path": "notepad.exe"
+        },
+        {
+          "name": "Calculator",
+          "path": "calc.exe"
+        },
+        {
+          "name": "File Explorer",
+          "path": "explorer.exe"
+        }
+      ]
+    },
+    {
+      "name": "System",
+      "items": [
+        {
+          "name": "Settings",
+          "path": "ms-settings:"
+        },
+        {
+          "name": "Task Manager",
+          "path": "taskmgr.exe"
+        },
+        {
+          "name": "Terminal (Admin)",
+          "path": "cmd.exe",
+          "runAsAdmin": true
+        }
+      ]
+    },
+    {
+      "name": "Web",
+      "items": [
+        {
+          "name": "Google",
+          "path": "https://www.google.com"
+        }
+      ]
+    }
+  ]
+}
