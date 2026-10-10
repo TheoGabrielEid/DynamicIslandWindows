@@ -18,6 +18,11 @@ import subprocess
 import warnings
 import json
 import ctypes
+import queue
+import threading
+import urllib.request
+import urllib.error
+import re
 
 try:
     import winreg
@@ -32,7 +37,8 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
         QAbstractButton, QSlider, QStackedWidget, QSystemTrayIcon, QMenu,
-        QGraphicsOpacityEffect, QPushButton, QFrame, QCheckBox
+        QGraphicsOpacityEffect, QPushButton, QFrame, QCheckBox, QScrollArea,
+        QInputDialog, QLineEdit, QTextEdit
     )
     from PyQt6.QtGui import (
         QPainter, QColor, QBrush, QPen, QFont, QPainterPath, QLinearGradient,
@@ -105,6 +111,29 @@ def font(size, weight=QFont.Weight.Normal):
     return f
 
 
+DEFAULT_BUTTONS = [
+    {"id": "ai", "label": "AI Assistant", "icon": "spark", "action": "ai"},
+    {"id": "snip", "label": "Screenshot", "icon": "snip", "action": "snip"},
+    {"id": "mute", "label": "Mute", "icon": "mute", "action": "mute"},
+    {"id": "lock", "label": "Lock", "icon": "lock", "action": "lock"},
+    {"id": "taskmgr", "label": "Task Manager", "icon": "pulse", "action": "taskmgr"},
+    {"id": "settings", "label": "Settings", "icon": "settings", "action": "settings"},
+]
+
+AVAILABLE_BUTTON_PRESETS = [
+    {"id": "ai", "label": "AI Assistant", "icon": "spark", "action": "ai"},
+    {"id": "calc", "label": "Calculator", "icon": "calc", "action": "calc"},
+    {"id": "notepad", "label": "Notepad", "icon": "note", "action": "notepad"},
+    {"id": "term", "label": "Terminal", "icon": "term", "action": "term"},
+    {"id": "explorer", "label": "Explorer", "icon": "folder", "action": "explorer"},
+    {"id": "browser", "label": "Browser", "icon": "globe", "action": "browser"},
+    {"id": "snip", "label": "Screenshot", "icon": "snip", "action": "snip"},
+    {"id": "mute", "label": "Mute", "icon": "mute", "action": "mute"},
+    {"id": "lock", "label": "Lock", "icon": "lock", "action": "lock"},
+    {"id": "taskmgr", "label": "Task Manager", "icon": "pulse", "action": "taskmgr"},
+    {"id": "settings", "label": "Settings", "icon": "settings", "action": "settings"},
+]
+
 # ───────────────────────── Settings & Persistence ─────────────────────────
 class SettingsManager:
     DEFAULTS = {
@@ -116,6 +145,11 @@ class SettingsManager:
         "start_on_boot": False,
         "accent_color": "#A8C7FA",
         "clipboard_toast": True,
+        "tools_buttons": DEFAULT_BUTTONS,
+        "ai_endpoint": "https://api.openai.com/v1/chat/completions",
+        "ai_model": "gpt-4o-mini",
+        "ai_api_key": "",
+        "ai_temperature": 0.7,
     }
 
     def __init__(self):
@@ -375,6 +409,146 @@ class AudioWorker(QThread):
                 pass
 
 
+# ───────────────────────── AI Streaming Service & Cache ─────────────────────────
+class AICache:
+    """Lightweight in-memory LRU-like cache for deterministic prompts/actions."""
+    _cache = {}
+    _MAX = 50
+
+    @classmethod
+    def get(cls, key: str):
+        return cls._cache.get(key)
+
+    @classmethod
+    def put(cls, key: str, val: str):
+        if len(cls._cache) >= cls._MAX:
+            try:
+                oldest = next(iter(cls._cache))
+                del cls._cache[oldest]
+            except Exception:
+                cls._cache.clear()
+        cls._cache[key] = val
+
+
+class AIServiceWorker(QThread):
+    """
+    Decoupled Background AI Thread.
+    Uses SSE/chunked streaming over standard HTTP (or Ollama/local OpenAI-compatible endpoints)
+    without blocking the PyQt GUI thread. Supports atomic cancellation and thread-safe signals.
+    """
+    chunk_received = pyqtSignal(str)    # partial token/chunk
+    response_finished = pyqtSignal(str) # full concatenated text
+    error_occurred = pyqtSignal(str)    # error message
+    started_streaming = pyqtSignal()    # time-to-first-token trigger
+
+    def __init__(self, endpoint: str, api_key: str, model: str, prompt: str,
+                 system_prompt: str = "You are a concise, helpful desktop assistant.",
+                 temperature: float = 0.7, parent=None):
+        super().__init__(parent)
+        self.endpoint = endpoint.strip() or "https://api.openai.com/v1/chat/completions"
+        self.api_key = api_key.strip()
+        self.model = model.strip() or "gpt-4o-mini"
+        self.prompt = prompt.strip()
+        self.system_prompt = system_prompt
+        self.temperature = float(temperature)
+        self._is_cancelled = threading.Event()
+        self._accumulated = []
+
+    def cancel(self):
+        """Immediately marks request as cancelled; terminates stream processing."""
+        self._is_cancelled.set()
+
+    def run(self):
+        if not self.prompt:
+            self.error_occurred.emit("Empty prompt")
+            return
+
+        cache_key = f"{self.model}:{self.prompt}"
+        cached = AICache.get(cache_key)
+        if cached:
+            if not self._is_cancelled.is_set():
+                self.started_streaming.emit()
+                for word in cached.split(" "):
+                    if self._is_cancelled.is_set():
+                        return
+                    self.chunk_received.emit(word + " ")
+                    time.sleep(0.015)
+                self.response_finished.emit(cached)
+            return
+
+        # Prepare request payload
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": self.prompt}
+            ],
+            "temperature": self.temperature,
+            "stream": True
+        }
+        body_bytes = json.dumps(payload).encode("utf-8")
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "DynamicIslandWindows/1.0"
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(self.endpoint, data=body_bytes, headers=headers, method="POST")
+
+        first_token = True
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                for raw_line in resp:
+                    if self._is_cancelled.is_set():
+                        return
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line == "data: [DONE]":
+                        break
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        try:
+                            chunk_obj = json.loads(data_str)
+                            choices = chunk_obj.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    if first_token:
+                                        first_token = False
+                                        self.started_streaming.emit()
+                                    self._accumulated.append(content)
+                                    self.chunk_received.emit(content)
+                        except Exception:
+                            pass
+
+            full_text = "".join(self._accumulated).strip()
+            if not self._is_cancelled.is_set():
+                if full_text:
+                    AICache.put(cache_key, full_text)
+                    self.response_finished.emit(full_text)
+                else:
+                    self.error_occurred.emit("Empty response from model")
+        except urllib.error.HTTPError as e:
+            if not self._is_cancelled.is_set():
+                err_body = ""
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")[:140]
+                except Exception:
+                    pass
+                msg = f"HTTP {e.code}: {e.reason}" + (f" ({err_body})" if err_body else "")
+                self.error_occurred.emit(msg)
+        except urllib.error.URLError as e:
+            if not self._is_cancelled.is_set():
+                self.error_occurred.emit(f"Network error: {e.reason}")
+        except Exception as e:
+            if not self._is_cancelled.is_set():
+                self.error_occurred.emit(f"Error: {e}")
+
+
 def gpu_stats():
     if not NVML:
         return None
@@ -534,6 +708,57 @@ def draw_icon(p: QPainter, name: str, r: QRectF, color: QColor, stroke=1.8):
     elif name == "close":
         p.drawLine(P(0.28, 0.28), P(0.72, 0.72))
         p.drawLine(P(0.72, 0.28), P(0.28, 0.72))
+    elif name == "plus":
+        p.drawLine(P(0.5, 0.22), P(0.5, 0.78))
+        p.drawLine(P(0.22, 0.5), P(0.78, 0.5))
+    elif name == "trash":
+        p.drawLine(P(0.24, 0.28), P(0.76, 0.28))
+        p.drawLine(P(0.4, 0.28), P(0.4, 0.2))
+        p.drawLine(P(0.4, 0.2), P(0.6, 0.2))
+        p.drawLine(P(0.6, 0.2), P(0.6, 0.28))
+        p.drawRoundedRect(R(0.3, 0.28, 0.4, 0.54), w * 0.05, w * 0.05)
+        p.drawLine(P(0.42, 0.38), P(0.42, 0.7))
+        p.drawLine(P(0.58, 0.38), P(0.58, 0.7))
+    elif name == "arrow_up":
+        p.drawLine(P(0.5, 0.76), P(0.5, 0.24))
+        p.drawLine(P(0.28, 0.44), P(0.5, 0.24))
+        p.drawLine(P(0.72, 0.44), P(0.5, 0.24))
+    elif name == "arrow_down":
+        p.drawLine(P(0.5, 0.24), P(0.5, 0.76))
+        p.drawLine(P(0.28, 0.56), P(0.5, 0.76))
+        p.drawLine(P(0.72, 0.56), P(0.5, 0.76))
+    elif name == "calc":
+        p.drawRoundedRect(R(0.22, 0.16, 0.56, 0.68), w * 0.08, w * 0.08)
+        p.drawRoundedRect(R(0.3, 0.24, 0.4, 0.16), w * 0.04, w * 0.04)
+        for ox in (0.34, 0.5, 0.66):
+            for oy in (0.48, 0.62, 0.74):
+                p.drawPoint(P(ox, oy))
+    elif name == "note":
+        p.drawRoundedRect(R(0.22, 0.16, 0.56, 0.68), w * 0.08, w * 0.08)
+        p.drawLine(P(0.32, 0.32), P(0.68, 0.32))
+        p.drawLine(P(0.32, 0.48), P(0.68, 0.48))
+        p.drawLine(P(0.32, 0.64), P(0.54, 0.64))
+    elif name == "term":
+        p.drawRoundedRect(R(0.18, 0.2, 0.64, 0.6), w * 0.08, w * 0.08)
+        p.drawLine(P(0.28, 0.38), P(0.42, 0.5))
+        p.drawLine(P(0.42, 0.5), P(0.28, 0.62))
+        p.drawLine(P(0.48, 0.62), P(0.66, 0.62))
+    elif name == "folder":
+        path.moveTo(P(0.18, 0.32)); path.lineTo(P(0.4, 0.32)); path.lineTo(P(0.48, 0.42))
+        path.lineTo(P(0.82, 0.42)); path.lineTo(P(0.82, 0.76)); path.lineTo(P(0.18, 0.76)); path.closeSubpath()
+        p.drawPath(path)
+    elif name == "globe":
+        p.drawEllipse(R(0.18, 0.18, 0.64, 0.64))
+        p.drawLine(P(0.18, 0.5), P(0.82, 0.5))
+        p.drawEllipse(R(0.33, 0.18, 0.34, 0.64))
+    elif name in ("spark", "ai"):
+        fill()
+        path.moveTo(P(0.5, 0.16))
+        path.quadTo(P(0.5, 0.5), P(0.84, 0.5))
+        path.quadTo(P(0.5, 0.5), P(0.5, 0.84))
+        path.quadTo(P(0.5, 0.5), P(0.16, 0.5))
+        path.quadTo(P(0.5, 0.5), P(0.5, 0.16))
+        p.drawPath(path)
     p.restore()
 
 
@@ -576,9 +801,12 @@ class IconButton(QAbstractButton):
 
 class TileButton(QAbstractButton):
     """M3 tonal tile: icon + label, rounded 20."""
-    def __init__(self, icon, label, accent=M3.PRIMARY, parent=None):
+    def __init__(self, icon, label, accent=M3.PRIMARY, parent=None, button_data=None, island=None, index=-1):
         super().__init__(parent)
         self.icon_name, self.label, self.accent = icon, label, accent
+        self.button_data = button_data or {}
+        self.island = island
+        self.index = index
         self.active = False
         self.setFixedHeight(64)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -586,6 +814,33 @@ class TileButton(QAbstractButton):
 
     def enterEvent(self, e): self._hover = True; self.update()
     def leaveEvent(self, e): self._hover = False; self.update()
+
+    def contextMenuEvent(self, e):
+        if not self.island:
+            super().contextMenuEvent(e)
+            return
+        m = QMenu(self)
+        self.island._menu_style(m)
+        total = len(self.island.get_buttons())
+        a_left = m.addAction("◀  Move Left") if self.index > 0 else None
+        a_right = m.addAction("▶  Move Right") if 0 <= self.index < total - 1 else None
+        m.addSeparator()
+        a_del = m.addAction("🗑️  Remove Button")
+        a_add = m.addAction("➕  Add Button...")
+        m.addSeparator()
+        a_sett = m.addAction("⚙️  Customize in Settings...")
+        act = m.exec(e.globalPos())
+        if act == a_left:
+            self.island.move_button(self.index, -1)
+        elif act == a_right:
+            self.island.move_button(self.index, 1)
+        elif act == a_del:
+            self.island.remove_button(self.index)
+        elif act == a_add:
+            self.island.show_add_button_picker(e.globalPos())
+        elif act == a_sett:
+            self.island.open_settings()
+        e.accept()
 
     def paintEvent(self, e):
         p = QPainter(self)
@@ -604,6 +859,34 @@ class TileButton(QAbstractButton):
         p.setPen(M3.ON_SURFACE)
         p.setFont(font(11, QFont.Weight.DemiBold))
         p.drawText(QRectF(r.x(), r.y() + 38, r.width(), 16), Qt.AlignmentFlag.AlignCenter, self.label)
+
+
+class AddTileButton(QAbstractButton):
+    """M3 dashed/translucent tile for adding a new button directly from Tools."""
+    def __init__(self, island, parent=None):
+        super().__init__(parent)
+        self.island = island
+        self.setFixedHeight(64)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._hover = False
+
+    def enterEvent(self, e): self._hover = True; self.update()
+    def leaveEvent(self, e): self._hover = False; self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        if self.isDown():
+            r = r.adjusted(2, 2, -2, -2)
+        p.setPen(QPen(QColor(255, 255, 255, 45 if self._hover else 25), 1, Qt.PenStyle.DashLine))
+        p.setBrush(QColor(255, 255, 255, 14 if self._hover else 6))
+        p.drawRoundedRect(r, 20, 20)
+        draw_icon(p, "plus", QRectF(r.center().x() - 9, r.y() + 13, 18, 18),
+                  M3.PRIMARY if self._hover else M3.MUTED)
+        p.setPen(M3.PRIMARY if self._hover else M3.MUTED)
+        p.setFont(font(11, QFont.Weight.DemiBold))
+        p.drawText(QRectF(r.x(), r.y() + 38, r.width(), 16), Qt.AlignmentFlag.AlignCenter, "Add")
 
 
 class Chip(QAbstractButton):
@@ -1055,25 +1338,17 @@ class SystemPage(QWidget):
 class ToolsPage(QWidget):
     def __init__(self, island):
         super().__init__()
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
-        grid = QGridLayout()
-        grid.setSpacing(8)
-        self.t_snip = TileButton("snip", "Screenshot")
-        self.t_mute = TileButton("mute", "Mute")
-        self.t_lock = TileButton("lock", "Lock")
-        self.t_task = TileButton("pulse", "Task Manager")
-        self.t_sett = TileButton("settings", "Settings")
-        self.t_snip.clicked.connect(island.snip)
-        self.t_mute.clicked.connect(island.toggle_mute)
-        self.t_lock.clicked.connect(island.lock)
-        self.t_task.clicked.connect(lambda: subprocess.Popen(["taskmgr"]))
-        self.t_sett.clicked.connect(island.open_settings)
-        for i, t in enumerate((self.t_snip, self.t_mute, self.t_lock, self.t_task, self.t_sett)):
-            grid.addWidget(t, 0, i)
-        root.addLayout(grid)
+        self.island = island
+        self.tiles = []
+        self.t_mute = None
 
+        self.root_lay = QVBoxLayout(self)
+        self.root_lay.setContentsMargins(0, 0, 0, 0)
+        self.root_lay.setSpacing(10)
+
+        self.grid = QGridLayout()
+        self.grid.setSpacing(8)
+        self.root_lay.addLayout(self.grid)
 
         clip = QWidget()
         clip.setFixedHeight(48)
@@ -1085,8 +1360,53 @@ class ToolsPage(QWidget):
         cl.addWidget(head)
         self.clip_text = label("Nothing copied yet", 12, M3.ON_SURFACE)
         cl.addWidget(self.clip_text, 1)
-        root.addWidget(clip)
-        root.addStretch()
+        self.root_lay.addWidget(clip)
+        self.root_lay.addStretch()
+
+        self.rebuild_buttons()
+
+    def rebuild_buttons(self):
+        # Clear existing items in grid
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self.tiles.clear()
+        self.t_mute = None
+
+        buttons = self.island.get_buttons()
+        # Max 5 buttons per row
+        cols = 5
+        idx = 0
+        for i, b in enumerate(buttons):
+            tile = TileButton(
+                b.get("icon", "pulse"),
+                b.get("label", "Action"),
+                button_data=b,
+                island=self.island,
+                index=i,
+                parent=self
+            )
+            # Wire click to execute action
+            tile.clicked.connect(lambda _, item=b: self.island.execute_button_action(item))
+            if b.get("action") == "mute" or b.get("id") == "mute":
+                self.t_mute = tile
+                self.t_mute.active = Volume.is_muted()
+            row = idx // cols
+            col = idx % cols
+            self.grid.addWidget(tile, row, col)
+            self.tiles.append(tile)
+            idx += 1
+
+        # Add '+' button at the end
+        add_btn = AddTileButton(self.island, parent=self)
+        add_btn.clicked.connect(lambda: self.island.show_add_button_picker(
+            add_btn.mapToGlobal(QPointF(0, add_btn.height()).toPoint())
+        ))
+        row = idx // cols
+        col = idx % cols
+        self.grid.addWidget(add_btn, row, col)
 
     def set_clip(self, text):
         fm = self.clip_text.fontMetrics()
@@ -1152,6 +1472,188 @@ class FocusPage(QWidget):
         right.addLayout(chips)
         right.addStretch()
         lay.addLayout(right, 1)
+
+
+class AIPage(QWidget):
+    """
+    Asynchronous Streaming AI Assistant page.
+    Features optimistic UI feedback, instant streaming rendering, request cancellation,
+    and thread-safe state synchronization.
+    """
+    def __init__(self, island):
+        super().__init__()
+        self.island = island
+        self.worker = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setSpacing(8)
+
+        # Status & header bar
+        hdr = QHBoxLayout()
+        hdr.setSpacing(6)
+        lbl_head = label("AI ASSISTANT", 11, M3.PRIMARY, QFont.Weight.Bold)
+        hdr.addWidget(lbl_head)
+        self.lbl_status = label("Ready", 11, M3.MUTED)
+        hdr.addWidget(self.lbl_status)
+        hdr.addStretch()
+
+        self.btn_cancel = QPushButton("Stop")
+        self.btn_cancel.setFont(font(10, QFont.Weight.DemiBold))
+        self.btn_cancel.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(255, 80, 80, 0.2);
+                color: #FF8080;
+                border: 1px solid rgba(255, 80, 80, 0.3);
+                border-radius: 6px;
+                padding: 2px 8px;
+            }}
+            QPushButton:hover {{ background: rgba(255, 80, 80, 0.4); }}
+        """)
+        self.btn_cancel.clicked.connect(self.cancel_request)
+        hdr.addWidget(self.btn_cancel)
+        lay.addLayout(hdr)
+
+        # Output text area
+        self.output_box = QTextEdit()
+        self.output_box.setReadOnly(True)
+        self.output_box.setPlaceholderText("Ask a question, summarize text, or type a request...")
+        self.output_box.setStyleSheet(f"""
+            QTextEdit {{
+                background: {M3.SURFACE_1.name()};
+                color: {M3.ON_SURFACE.name()};
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
+                padding: 8px;
+                font-family: '{FONT}';
+                font-size: 12px;
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 4px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 0.18);
+                border-radius: 2px;
+            }}
+        """)
+        lay.addWidget(self.output_box, 1)
+
+        # Input box and quick action chips
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+
+        self.input_edit = QLineEdit()
+        self.input_edit.setPlaceholderText("Type a prompt and press Enter...")
+        self.input_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {M3.SURFACE_2.name()};
+                color: {M3.ON_SURFACE.name()};
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 12px;
+                padding: 6px 12px;
+                font-family: '{FONT}';
+                font-size: 12px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {M3.PRIMARY.name()};
+            }}
+        """)
+        self.input_edit.returnPressed.connect(self.send_prompt)
+        input_row.addWidget(self.input_edit, 1)
+
+        self.btn_send = QPushButton("Send")
+        self.btn_send.setFont(font(11, QFont.Weight.DemiBold))
+        self.btn_send.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_send.setStyleSheet(f"""
+            QPushButton {{
+                background: {M3.PRIMARY.name()};
+                color: {M3.ON_PRIMARY.name()};
+                border: none;
+                border-radius: 12px;
+                padding: 6px 14px;
+            }}
+            QPushButton:hover {{ background: #FFFFFF; color: #000000; }}
+            QPushButton:disabled {{ background: {M3.SURFACE_3.name()}; color: {M3.MUTED.name()}; }}
+        """)
+        self.btn_send.clicked.connect(self.send_prompt)
+        input_row.addWidget(self.btn_send)
+        lay.addLayout(input_row)
+
+    def cancel_request(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.lbl_status.setText("Cancelled")
+            self.lbl_status.setStyleSheet(f"color: {M3.MUTED.name()};")
+            self.btn_cancel.setVisible(False)
+            self.btn_send.setEnabled(True)
+            self.island.aura = 0.0
+
+    def send_prompt(self, explicit_prompt: str = None):
+        text = explicit_prompt if explicit_prompt is not None else self.input_edit.text().strip()
+        if not text:
+            return
+
+        self.cancel_request()
+
+        # Immediate optimistic visual feedback
+        self.input_edit.clear()
+        self.output_box.clear()
+        self.lbl_status.setText("Thinking...")
+        self.lbl_status.setStyleSheet(f"color: {M3.PRIMARY.name()};")
+        self.btn_cancel.setVisible(True)
+        self.btn_send.setEnabled(False)
+
+        # Pulse aura on island for immediate optimistic tactile feedback
+        self.island.aura = 1.0
+        self.island.aura_color = M3.PRIMARY
+
+        endpoint = self.island.settings.get("ai_endpoint", "https://api.openai.com/v1/chat/completions")
+        api_key = self.island.settings.get("ai_api_key", "")
+        model = self.island.settings.get("ai_model", "gpt-4o-mini")
+        temp = float(self.island.settings.get("ai_temperature", 0.7))
+
+        self.worker = AIServiceWorker(
+            endpoint=endpoint,
+            api_key=api_key,
+            model=model,
+            prompt=text,
+            temperature=temp,
+            parent=self
+        )
+        self.worker.started_streaming.connect(self._on_started_streaming)
+        self.worker.chunk_received.connect(self._on_chunk)
+        self.worker.response_finished.connect(self._on_finished)
+        self.worker.error_occurred.connect(self._on_error)
+        self.worker.start()
+
+    def _on_started_streaming(self):
+        self.lbl_status.setText("Generating...")
+        self.lbl_status.setStyleSheet(f"color: {M3.GREEN.name()};")
+
+    def _on_chunk(self, chunk: str):
+        self.output_box.moveCursor(self.output_box.textCursor().MoveOperation.End)
+        self.output_box.insertPlainText(chunk)
+        self.output_box.moveCursor(self.output_box.textCursor().MoveOperation.End)
+
+    def _on_finished(self, full_text: str):
+        self.lbl_status.setText("Done")
+        self.lbl_status.setStyleSheet(f"color: {M3.MUTED.name()};")
+        self.btn_cancel.setVisible(False)
+        self.btn_send.setEnabled(True)
+        self.island.aura = 0.0
+
+    def _on_error(self, err_msg: str):
+        self.lbl_status.setText("Error")
+        self.lbl_status.setStyleSheet(f"color: {M3.ERROR.name()};")
+        self.output_box.setPlainText(f"⚠️ {err_msg}")
+        self.btn_cancel.setVisible(False)
+        self.btn_send.setEnabled(True)
+        self.island.aura = 0.6
+        self.island.aura_color = M3.ERROR
+
 
 
 # ───────────────────────── Settings UI ─────────────────────────
@@ -1260,9 +1762,9 @@ class SettingsDialog(QWidget):
         """)
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(14)
+        main_root = QVBoxLayout(self)
+        main_root.setContentsMargins(18, 16, 18, 16)
+        main_root.setSpacing(10)
 
         # Header
         hdr = QHBoxLayout()
@@ -1283,7 +1785,7 @@ class SettingsDialog(QWidget):
         t_lbl = QLabel("Capsule Settings")
         t_lbl.setFont(font(15, QFont.Weight.Bold))
         t_lbl.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
-        sub_lbl = QLabel("Configure geometry, accents & behavior")
+        sub_lbl = QLabel("Customize buttons, geometry & behavior")
         sub_lbl.setFont(font(11, QFont.Weight.Normal))
         sub_lbl.setStyleSheet(f"color: {M3.MUTED.name()};")
         title_box.addWidget(t_lbl)
@@ -1294,7 +1796,90 @@ class SettingsDialog(QWidget):
         close_btn = IconButton("close", size=32, icon_size=12)
         close_btn.clicked.connect(self.hide)
         hdr.addWidget(close_btn)
-        root.addLayout(hdr)
+        main_root.addLayout(hdr)
+
+        # Scroll Area for all settings cards
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: rgba(255, 255, 255, 0.2);
+                min-height: 24px;
+                border-radius: 3px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {M3.PRIMARY.name()};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(container)
+        root.setContentsMargins(4, 4, 8, 4)
+        root.setSpacing(12)
+
+        # ─── Group 0: Buttons & Quick Actions ───
+        grp_btns = QFrame()
+        grp_btns.setStyleSheet(f"background: {M3.SURFACE_2.name()}; border-radius: 14px;")
+        btns_layout = QVBoxLayout(grp_btns)
+        btns_layout.setContentsMargins(14, 12, 14, 12)
+        btns_layout.setSpacing(10)
+
+        hdr_btns_row = QHBoxLayout()
+        lbl_sec0 = QLabel("BUTTONS & QUICK ACTIONS")
+        lbl_sec0.setFont(font(10, QFont.Weight.Bold))
+        lbl_sec0.setStyleSheet(f"color: {M3.PRIMARY.name()};")
+        hdr_btns_row.addWidget(lbl_sec0)
+        hdr_btns_row.addStretch()
+
+        btn_add_preset = QPushButton("+ Add Button")
+        btn_add_preset.setFont(font(11, QFont.Weight.DemiBold))
+        btn_add_preset.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_add_preset.setStyleSheet(f"""
+            QPushButton {{
+                background: {M3.SURFACE_3.name()};
+                color: {M3.ON_SURFACE.name()};
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 8px;
+                padding: 4px 10px;
+            }}
+            QPushButton:hover {{ background: {M3.PRIMARY.name()}; color: {M3.ON_PRIMARY.name()}; }}
+        """)
+        btn_add_preset.clicked.connect(lambda: self.island.show_add_button_picker(
+            btn_add_preset.mapToGlobal(QPointF(0, btn_add_preset.height()).toPoint())
+        ))
+        hdr_btns_row.addWidget(btn_add_preset)
+
+        btn_rst_btns = QPushButton("Reset")
+        btn_rst_btns.setFont(font(11, QFont.Weight.Normal))
+        btn_rst_btns.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_rst_btns.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {M3.MUTED.name()};
+                border: none;
+                padding: 4px 6px;
+            }}
+            QPushButton:hover {{ color: {M3.ERROR.name()}; }}
+        """)
+        btn_rst_btns.clicked.connect(self.island.reset_buttons)
+        hdr_btns_row.addWidget(btn_rst_btns)
+        btns_layout.addLayout(hdr_btns_row)
+
+        self.btns_list_layout = QVBoxLayout()
+        self.btns_list_layout.setSpacing(6)
+        btns_layout.addLayout(self.btns_list_layout)
+        root.addWidget(grp_btns)
 
         # ─── Group 1: Geometry & Position ───
         grp_geo = QFrame()
@@ -1452,6 +2037,65 @@ class SettingsDialog(QWidget):
         beh_layout.addWidget(self.cb_toast)
         root.addWidget(grp_beh)
 
+        # ─── Group 4: AI Model & API ───
+        grp_ai = QFrame()
+        grp_ai.setStyleSheet(f"background: {M3.SURFACE_2.name()}; border-radius: 14px;")
+        ai_layout = QVBoxLayout(grp_ai)
+        ai_layout.setContentsMargins(14, 12, 14, 12)
+        ai_layout.setSpacing(8)
+
+        lbl_sec4 = QLabel("AI MODEL & INTEGRATION")
+        lbl_sec4.setFont(font(10, QFont.Weight.Bold))
+        lbl_sec4.setStyleSheet(f"color: {M3.PRIMARY.name()};")
+        ai_layout.addWidget(lbl_sec4)
+
+        lbl_ep = QLabel("Endpoint URL (OpenAI / Ollama / Local compatible)")
+        lbl_ep.setFont(font(11, QFont.Weight.DemiBold))
+        lbl_ep.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
+        ai_layout.addWidget(lbl_ep)
+        self.edit_ai_ep = QLineEdit()
+        self.edit_ai_ep.setStyleSheet(f"""
+            QLineEdit {{
+                background: {M3.SURFACE_3.name()}; color: {M3.ON_SURFACE.name()};
+                border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 10px; font-size: 11px;
+            }}
+        """)
+        self.edit_ai_ep.textChanged.connect(lambda v: self.island.apply_setting("ai_endpoint", v))
+        ai_layout.addWidget(self.edit_ai_ep)
+
+        lbl_mod = QLabel("Model Name (e.g., gpt-4o-mini, llama3, mistral)")
+        lbl_mod.setFont(font(11, QFont.Weight.DemiBold))
+        lbl_mod.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
+        ai_layout.addWidget(lbl_mod)
+        self.edit_ai_model = QLineEdit()
+        self.edit_ai_model.setStyleSheet(f"""
+            QLineEdit {{
+                background: {M3.SURFACE_3.name()}; color: {M3.ON_SURFACE.name()};
+                border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 10px; font-size: 11px;
+            }}
+        """)
+        self.edit_ai_model.textChanged.connect(lambda v: self.island.apply_setting("ai_model", v))
+        ai_layout.addWidget(self.edit_ai_model)
+
+        lbl_key = QLabel("API Key (optional for local models)")
+        lbl_key.setFont(font(11, QFont.Weight.DemiBold))
+        lbl_key.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
+        ai_layout.addWidget(lbl_key)
+        self.edit_ai_key = QLineEdit()
+        self.edit_ai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_ai_key.setStyleSheet(f"""
+            QLineEdit {{
+                background: {M3.SURFACE_3.name()}; color: {M3.ON_SURFACE.name()};
+                border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 6px 10px; font-size: 11px;
+            }}
+        """)
+        self.edit_ai_key.textChanged.connect(lambda v: self.island.apply_setting("ai_api_key", v))
+        ai_layout.addWidget(self.edit_ai_key)
+        root.addWidget(grp_ai)
+
+        scroll.setWidget(container)
+        main_root.addWidget(scroll, 1)
+
         # ─── Footer ───
         footer = QHBoxLayout()
         footer.setSpacing(10)
@@ -1487,7 +2131,7 @@ class SettingsDialog(QWidget):
         """)
         btn_done.clicked.connect(self.hide)
         footer.addWidget(btn_done)
-        root.addLayout(footer)
+        main_root.addLayout(footer)
 
     def _on_w_changed(self, v):
         self.lbl_w_val.setText(f"{v} px")
@@ -1562,6 +2206,121 @@ class SettingsDialog(QWidget):
         self.cb_toast.blockSignals(True)
         self.cb_toast.setChecked(bool(s.get("clipboard_toast", True)))
         self.cb_toast.blockSignals(False)
+
+        if hasattr(self, "edit_ai_ep"):
+            self.edit_ai_ep.blockSignals(True)
+            self.edit_ai_ep.setText(str(s.get("ai_endpoint", "https://api.openai.com/v1/chat/completions")))
+            self.edit_ai_ep.blockSignals(False)
+
+        if hasattr(self, "edit_ai_model"):
+            self.edit_ai_model.blockSignals(True)
+            self.edit_ai_model.setText(str(s.get("ai_model", "gpt-4o-mini")))
+            self.edit_ai_model.blockSignals(False)
+
+        if hasattr(self, "edit_ai_key"):
+            self.edit_ai_key.blockSignals(True)
+            self.edit_ai_key.setText(str(s.get("ai_api_key", "")))
+            self.edit_ai_key.blockSignals(False)
+
+        self.sync_buttons_list()
+
+    def sync_buttons_list(self):
+        while self.btns_list_layout.count():
+            item = self.btns_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        buttons = self.island.get_buttons()
+        n = len(buttons)
+
+        if not buttons:
+            empty_lbl = QLabel("No active buttons. Click '+ Add Button' above.")
+            empty_lbl.setFont(font(11, QFont.Weight.Normal))
+            empty_lbl.setStyleSheet(f"color: {M3.MUTED.name()}; padding: 6px 0;")
+            self.btns_list_layout.addWidget(empty_lbl)
+            return
+
+        for i, b in enumerate(buttons):
+            row = QFrame()
+            row.setStyleSheet(f"""
+                QFrame {{
+                    background: {M3.SURFACE_3.name()};
+                    border-radius: 10px;
+                }}
+            """)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(10, 6, 8, 6)
+            rl.setSpacing(8)
+
+            ic = QWidget()
+            ic.setFixedSize(22, 22)
+            icon_name = b.get("icon", "pulse")
+            def _make_icon_painter(iname):
+                def _paint(e):
+                    p = QPainter(ic)
+                    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    draw_icon(p, iname, QRectF(2, 2, 18, 18), M3.PRIMARY)
+                return _paint
+            ic.paintEvent = _make_icon_painter(icon_name)
+            rl.addWidget(ic)
+
+            lbl = QLabel(b.get("label", "Action"))
+            lbl.setFont(font(12, QFont.Weight.DemiBold))
+            lbl.setStyleSheet(f"color: {M3.ON_SURFACE.name()};")
+            rl.addWidget(lbl, 1)
+
+            btn_style = f"""
+                QPushButton {{
+                    background: rgba(255, 255, 255, 0.08);
+                    color: {M3.ON_SURFACE.name()};
+                    border: none;
+                    border-radius: 6px;
+                    min-width: 26px;
+                    max-width: 26px;
+                    min-height: 26px;
+                    max-height: 26px;
+                    font-size: 11px;
+                }}
+                QPushButton:hover {{ background: rgba(255, 255, 255, 0.2); }}
+                QPushButton:disabled {{ color: rgba(255, 255, 255, 0.2); background: transparent; }}
+            """
+
+            btn_up = QPushButton("▲")
+            btn_up.setStyleSheet(btn_style)
+            btn_up.setEnabled(i > 0)
+            btn_up.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_up.clicked.connect(lambda _, idx=i: self.island.move_button(idx, -1))
+            rl.addWidget(btn_up)
+
+            btn_down = QPushButton("▼")
+            btn_down.setStyleSheet(btn_style)
+            btn_down.setEnabled(i < n - 1)
+            btn_down.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_down.clicked.connect(lambda _, idx=i: self.island.move_button(idx, 1))
+            rl.addWidget(btn_down)
+
+            del_style = f"""
+                QPushButton {{
+                    background: rgba(255, 80, 80, 0.15);
+                    color: #FF8080;
+                    border: none;
+                    border-radius: 6px;
+                    min-width: 26px;
+                    max-width: 26px;
+                    min-height: 26px;
+                    max-height: 26px;
+                    font-size: 11px;
+                }}
+                QPushButton:hover {{ background: rgba(255, 80, 80, 0.35); color: #FFFFFF; }}
+            """
+            btn_del = QPushButton("✕")
+            btn_del.setStyleSheet(del_style)
+            btn_del.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn_del.clicked.connect(lambda _, idx=i: self.island.remove_button(idx))
+            rl.addWidget(btn_del)
+
+            self.btns_list_layout.addWidget(row)
 
 
 # ───────────────────────── The capsule window ─────────────────────────
@@ -1672,8 +2431,8 @@ class DynamicCapsule(QWidget):
         dcol.addWidget(self.h_time); dcol.addWidget(self.h_date)
         header.addLayout(dcol)
         header.addStretch()
-        self.tabs = SegmentedTabs(["Media", "System", "Tools", "Focus"])
-        self.tabs.setFixedWidth(300)
+        self.tabs = SegmentedTabs(["Media", "System", "Tools", "Focus", "AI"])
+        self.tabs.setFixedWidth(360)
         header.addWidget(self.tabs, 0, Qt.AlignmentFlag.AlignVCenter)
         pl.addLayout(header)
 
@@ -1682,7 +2441,8 @@ class DynamicCapsule(QWidget):
         self.system = SystemPage()
         self.tools = ToolsPage(self)
         self.focus = FocusPage(self)
-        for pg in (self.media, self.system, self.tools, self.focus):
+        self.ai = AIPage(self)
+        for pg in (self.media, self.system, self.tools, self.focus, self.ai):
             self.stack.addWidget(pg)
         self.tabs.changed.connect(self.stack.setCurrentIndex)
         pl.addWidget(self.stack, 1)
@@ -1800,6 +2560,8 @@ class DynamicCapsule(QWidget):
         if not self.expanded or self.pinned:
             return
         self.expanded = False
+        if hasattr(self, "ai") and self.ai is not None:
+            self.ai.cancel_request()
         self._update_compact_target()
         self._frame()
 
@@ -1856,8 +2618,9 @@ class DynamicCapsule(QWidget):
     def toggle_mute(self):
         m = Volume.toggle_mute()
         self.media.vol_icon.set_icon("mute" if m else "speaker")
-        self.tools.t_mute.active = m
-        self.tools.t_mute.update()
+        if self.tools.t_mute:
+            self.tools.t_mute.active = m
+            self.tools.t_mute.update()
         self.toast("Muted" if m else "Sound on", "mute" if m else "speaker", M3.ERROR if m else M3.PRIMARY)
 
     def toggle_clock_pause(self):
@@ -1891,6 +2654,114 @@ class DynamicCapsule(QWidget):
         except Exception:
             pass
 
+    # ---------- button customization ----------
+    def get_buttons(self):
+        btns = self.settings.get("tools_buttons", DEFAULT_BUTTONS)
+        if not isinstance(btns, list):
+            btns = list(DEFAULT_BUTTONS)
+        return btns
+
+    def set_buttons(self, btns):
+        self.settings.set("tools_buttons", btns)
+        if hasattr(self, "tools") and self.tools is not None:
+            self.tools.rebuild_buttons()
+        if hasattr(self, "settings_dialog") and self.settings_dialog is not None:
+            self.settings_dialog.sync_buttons_list()
+
+    def move_button(self, index: int, direction: int):
+        btns = list(self.get_buttons())
+        target = index + direction
+        if 0 <= index < len(btns) and 0 <= target < len(btns):
+            btns[index], btns[target] = btns[target], btns[index]
+            self.set_buttons(btns)
+
+    def remove_button(self, index: int):
+        btns = list(self.get_buttons())
+        if 0 <= index < len(btns):
+            item = btns.pop(index)
+            self.set_buttons(btns)
+            self.toast(f"Removed '{item.get('label', 'button')}'", "trash", M3.ERROR)
+
+    def add_button(self, button_data: dict):
+        btns = list(self.get_buttons())
+        btns.append(button_data)
+        self.set_buttons(btns)
+        self.toast(f"Added '{button_data.get('label', 'button')}'", "plus", M3.PRIMARY)
+
+    def reset_buttons(self):
+        self.set_buttons(list(DEFAULT_BUTTONS))
+        self.toast("Reset buttons to defaults", "settings", M3.PRIMARY)
+
+    def execute_button_action(self, b: dict):
+        act = b.get("action", "")
+        if act == "ai":
+            self.expand()
+            self.tabs.set_index(4)
+        elif act == "snip":
+            self.snip()
+        elif act == "mute":
+            self.toggle_mute()
+        elif act == "lock":
+            self.lock()
+        elif act == "taskmgr":
+            subprocess.Popen(["taskmgr"])
+        elif act == "settings":
+            self.open_settings()
+        elif act == "calc":
+            subprocess.Popen("calc.exe", shell=True)
+        elif act == "notepad":
+            subprocess.Popen("notepad.exe", shell=True)
+        elif act == "term":
+            subprocess.Popen("wt.exe" if os.system("where wt >nul 2>&1") == 0 else "cmd.exe", shell=True)
+        elif act == "explorer":
+            subprocess.Popen("explorer.exe", shell=True)
+        elif act == "browser":
+            subprocess.Popen("start https://www.google.com", shell=True)
+        elif act == "custom":
+            cmd = b.get("cmd", "")
+            if cmd:
+                subprocess.Popen(cmd, shell=True)
+        else:
+            cmd = b.get("cmd") or act
+            if cmd:
+                try:
+                    subprocess.Popen(cmd, shell=True)
+                except Exception:
+                    pass
+
+    def show_add_button_picker(self, global_pos):
+        m = QMenu(self)
+        self._menu_style(m)
+        m.addAction("⚡ Presets").setEnabled(False)
+        m.addSeparator()
+        preset_acts = {}
+        for p in AVAILABLE_BUTTON_PRESETS:
+            act = m.addAction(f"{p['label']}")
+            preset_acts[act] = p
+        m.addSeparator()
+        a_custom = m.addAction("➕  Custom Command / App...")
+        chosen = m.exec(global_pos)
+        if chosen in preset_acts:
+            self.add_button(dict(preset_acts[chosen]))
+        elif chosen == a_custom:
+            self.prompt_add_custom_button()
+
+    def prompt_add_custom_button(self):
+        name, ok1 = QInputDialog.getText(self, "Add Custom Button", "Button Name:")
+        if not ok1 or not name.strip():
+            return
+        cmd, ok2 = QInputDialog.getText(self, "Add Custom Button", "Command or App path to run:")
+        if not ok2 or not cmd.strip():
+            return
+        btn = {
+            "id": f"custom_{int(time.time())}",
+            "label": name.strip(),
+            "icon": "term",
+            "action": "custom",
+            "cmd": cmd.strip()
+        }
+        self.add_button(btn)
+
     def start_focus(self, secs):
         self.focus_left = self.focus_total = secs
         self.focus_paused = False
@@ -1923,8 +2794,9 @@ class DynamicCapsule(QWidget):
         self.media.art.playing = playing
         self.media.btn_play.set_icon("pause" if playing else "play")
         self.media.vol_icon.set_icon("mute" if is_muted else "speaker")
-        self.tools.t_mute.active = is_muted
-        self.tools.t_mute.update()
+        if self.tools.t_mute:
+            self.tools.t_mute.active = is_muted
+            self.tools.t_mute.update()
 
         if playing:
             self.media.title.setText(app_name or "Now playing")
@@ -2083,7 +2955,7 @@ class DynamicCapsule(QWidget):
         m.addSeparator()
         a_pin = m.addAction("📌  Unpin" if self.pinned else "📌  Keep expanded")
         m.addSeparator()
-        pages = [m.addAction(f"📄  {n}") for n in ("Media", "System", "Tools", "Focus")]
+        pages = [m.addAction(f"📄  {n}") for n in ("Media", "System", "Tools", "Focus", "AI")]
         m.addSeparator()
         a_quit = m.addAction("🚪  Quit")
         a = m.exec(pos)
@@ -2126,6 +2998,8 @@ class DynamicCapsule(QWidget):
             pass
 
     def closeEvent(self, e):
+        if hasattr(self, "ai") and self.ai is not None:
+            self.ai.cancel_request()
         if hasattr(self, "audio_worker") and self.audio_worker is not None:
             self.audio_worker.stop()
         if hasattr(self, "settings_dialog") and self.settings_dialog is not None:
